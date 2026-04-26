@@ -240,6 +240,85 @@ class TestQueryParams:
         params = dict(server.requests[0].url.params)
         assert params["order"] == "endDate"
 
+    @pytest.mark.asyncio
+    async def test_default_params_include_all_tradeable_filters(self):
+        """By default, all server-side tradeability filters are sent.
+        This is defense-in-depth — even though Gamma may already exclude
+        these, we explicitly request the filtered set."""
+        server = MockGammaServer(total_markets=1)
+        client = await make_client_with_mock(server)
+        try:
+            async for _ in client.iter_markets():
+                pass
+        finally:
+            await client._client.aclose()
+
+        params = dict(server.requests[0].url.params)
+        assert params["active"] == "true"
+        assert params["closed"] == "false"
+        assert params["archived"] == "false"
+        assert params["acceptingOrders"] == "true"
+        assert params["enableOrderBook"] == "true"
+
+    @pytest.mark.asyncio
+    async def test_none_omits_param(self):
+        """Passing None for a filter omits it from the request entirely,
+        letting Gamma's default apply."""
+        server = MockGammaServer(total_markets=1)
+        client = await make_client_with_mock(server)
+        try:
+            async for _ in client.iter_markets(
+                active=None,
+                accepting_orders=None,
+                enable_order_book=None,
+            ):
+                pass
+        finally:
+            await client._client.aclose()
+
+        params = dict(server.requests[0].url.params)
+        assert "active" not in params
+        assert "acceptingOrders" not in params
+        assert "enableOrderBook" not in params
+        # Non-None ones should still be there
+        assert params["closed"] == "false"
+        assert params["archived"] == "false"
+
+    @pytest.mark.asyncio
+    async def test_query_filter_does_not_remove_client_filter_responsibility(self):
+        """Even with all tradeability params sent server-side, if Gamma
+        ignores them and returns a non-tradeable market, the client-side
+        ``is_tradeable_binary_market`` filter must still catch it.
+
+        This test simulates a buggy/lying Gamma that returns a
+        ``acceptingOrders=false`` market despite our query asking for
+        ``acceptingOrders=true``."""
+        from polymarket_wal.market_filter import is_tradeable_binary_market
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            page = [
+                make_market(1),
+                {**make_market(2), "acceptingOrders": False},  # Gamma "lies"
+            ]
+            return httpx.Response(200, json=page)
+
+        client = GammaClient()
+        client._client = httpx.AsyncClient(
+            base_url="https://gamma-api.polymarket.com",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            results = [pair async for pair in client.iter_markets()]
+        finally:
+            await client._client.aclose()
+
+        # iter_markets parses both — it doesn't apply the tradeable filter
+        assert len(results) == 2
+        # The client-side filter is what protects us
+        tradeable = [m for m, _ in results if is_tradeable_binary_market(m)]
+        assert len(tradeable) == 1
+        assert tradeable[0].id == "1"
+
 
 class TestParseFiltering:
     @pytest.mark.asyncio

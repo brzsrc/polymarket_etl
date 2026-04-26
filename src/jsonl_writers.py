@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Iterable
@@ -57,7 +58,7 @@ class MarketsJsonlWriter:
             "raw": raw_record,
         }
         self._fh.write(self._encoder.encode(wrapper))
-        self._fh.write(b"\n")
+        self._fh.write(b"\n\n")
 
 async def fetch_all_active_binary_markets(
     client: GammaClient,
@@ -90,7 +91,6 @@ async def fetch_all_active_binary_markets(
         ``DiscoveryResult`` with the parsed markets and flattened token_id
         set ready to feed into the WS subscription manager.
     """
-    started = datetime.now(timezone.utc)
     raw_records_seen = 0
     parsed_markets: list[Market] = []
 
@@ -100,10 +100,10 @@ async def fetch_all_active_binary_markets(
 
     with writer_ctx as writer:
         async for market, raw in client.iter_markets():
-            raw_records_seen += 1
+            # raw_records_seen += 1
             # duoble check all markets are valid
-            if not is_tradeable_binary_market(market):
-                continue
+            # if not is_tradeable_binary_market(market):
+            #     continue
             parsed_markets.append(market)
             # ts_recv is the discovery cycle's start time. We deliberately
             # use a single timestamp for the whole cycle rather than
@@ -112,4 +112,16 @@ async def fetch_all_active_binary_markets(
             # de-duplication ("give me each market's most recent record")
             # trivially work via cycle timestamp.
             writer.write(now_ns(), raw)
+    print("len(parsed_markets): ", len(parsed_markets))
     return
+
+
+async def main():
+    async with GammaClient() as client:
+        await fetch_all_active_binary_markets(
+            client,
+            markets_jsonl_path=Path("markets2.jsonl"),
+        )
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -89,6 +89,8 @@ class GammaClient:
                 # Booleans are sent as "true"/"false" strings; httpx handles this.
                 "active": "true",
                 "closed": "false",
+                "archived": "false",
+                "enable_order_book": "true",
             }
 
             page = await self._get_page(params)
@@ -124,7 +126,7 @@ async def main():
         for market, raw in markets[:5]:
             print(market.question)
         with open("markets.jsonl", "wb") as f:
-            f.write(b"\n\n".join(msgspec.json.encode(raw) for _, raw in markets))
+            f.write(b"\n".join(msgspec.json.encode(raw) for _, raw in markets))
 
 if __name__ == '__main__':
     asyncio.run(main())

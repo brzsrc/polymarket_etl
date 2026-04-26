@@ -159,34 +159,68 @@ class GammaClient:
 
     async def iter_markets(
         self,
-        active: bool = True,
-        closed: bool = False,
+        active: bool | None = True,
+        closed: bool | None = False,
+        archived: bool | None = False,
+        accepting_orders: bool | None = True,
+        enable_order_book: bool | None = True,
         extra_params: dict[str, Any] | None = None,
     ) -> AsyncIterator[tuple[Market, dict[str, Any]]]:
         """
         Iterate over all markets matching the given filters, handling
         pagination internally.
 
+        All filter args are passed to Gamma as query params. Pass ``None`` to
+        omit a param entirely (Gamma's default applies).
+
+        IMPORTANT — defense in depth:
+
+        Even with these query filters set, the caller MUST still apply the
+        client-side ``is_tradeable_binary_market`` filter to the results.
+        Reasons:
+
+        1. Gamma's filter behavior is undocumented and a black box. Our tests
+           against the live API in April 2026 showed that
+           ``acceptingOrders=true``/``archived=false``/``enableOrderBook=true``
+           had no observable effect (because ``active=true&closed=false`` is
+           already very clean), but that could change either direction
+           silently.
+        2. We want to be robust to Gamma silently dropping a filter param —
+           if they ignore ``acceptingOrders=true`` one day, we should still
+           reject paused markets.
+        3. ``parse_market`` does the binary-only filter (token count == 2)
+           which Gamma can't express as a query.
+
+        So query filters here are an *optimization hint*, not a contract.
+
         Yields ``(Market, raw_dict)``. Records that don't parse as a binary
-        market (e.g. multi-outcome) are silently skipped — they're not
-        relevant to us.
+        market (e.g. multi-outcome) are silently skipped.
 
         On a fatal error mid-iteration, raises ``GammaError``. The caller can
         either retry the whole iteration on the next tick, or use whatever
         partial results it accumulated. We don't try to be clever about
         partial state — this is a discovery cycle, not a database transaction.
         """
+        # Build the static portion of the params (everything except offset)
+        # once, since it doesn't change per page.
+        base_params: dict[str, Any] = {"limit": self._page_size}
+        for key, value in (
+            ("active", active),
+            ("closed", closed),
+            ("archived", archived),
+            ("acceptingOrders", accepting_orders),
+            ("enableOrderBook", enable_order_book),
+        ):
+            if value is not None:
+                # httpx serializes bools as "True"/"False" by default, which
+                # Gamma rejects. Force lowercase strings explicitly.
+                base_params[key] = str(value).lower()
+        if extra_params:
+            base_params.update(extra_params)
+
         offset = 0
         while True:
-            params: dict[str, Any] = {
-                "limit": self._page_size,
-                "offset": offset,
-                # Booleans are sent as "true"/"false" strings; httpx handles this.
-                "active": str(active).lower(),
-                "closed": str(closed).lower(),
-            }
-            if extra_params:
-                params.update(extra_params)
+            params = {**base_params, "offset": offset}
 
             page = await self._get_page(params)
 
@@ -207,11 +241,3 @@ class GammaClient:
                 return
 
             offset += self._page_size
-
-    async def fetch_all_markets(
-        self,
-        active: bool = True,
-        closed: bool = False,
-    ) -> list[tuple[Market, dict[str, Any]]]:
-        """Convenience: collect all markets into a list. ~45k records, a few MB."""
-        return [pair async for pair in self.iter_markets(active=active, closed=closed)]

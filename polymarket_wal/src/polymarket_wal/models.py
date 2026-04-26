@@ -67,7 +67,7 @@ class Market(msgspec.Struct, frozen=True, kw_only=True):
 def _parse_json_string_field(value: Any) -> list:
     """
     Gamma returns ``outcomes`` etc. as a JSON-encoded string of an array,
-    e.g. the field is literally '["Yes", "No"]' not ["Yes", "No"].
+    e.g. the field is literally ``'["Yes", "No"]'`` not ``["Yes", "No"]``.
     Sometimes (rarely) it might already be an array. Handle both, fail loudly
     on anything else so we notice schema drift.
     """
@@ -90,11 +90,6 @@ def parse_market(raw: dict[str, Any]) -> Market | None:
     container that snuck in, or a market without CLOB tokens). We don't raise
     on missing optional fields because Gamma's responses include a lot of
     half-populated records and we'd rather skip than crash the whole run.
-
-    raw:
-    [{'id': '2036399', 'question': 'US x Iran ceasefire extended by April 22, 2026?', 'conditionId': '0x1d2787cb8aed975d092b2799ed6f4083e9445f7420cdc09e9d47e7d54356c6cd',
-    'clobTokenIds': '["50049642142024617231697970377792489304039200104142714216386619263735691638204", "110959653450933276250915064669875552310439627880508793089816880777942697720191"]'
-    'outcomes': '["Yes", "No"]',
     """
     try:
         token_ids_list = _parse_json_string_field(raw.get("clobTokenIds"))
