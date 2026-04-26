@@ -75,10 +75,20 @@ class MockWSConnection:
         self,
         asset_ids: tuple[str, ...],
         raw_bytes: bytes,
+        parsed=None,
     ) -> None:
-        """Test helper: pretend the server sent us this message."""
+        """Test helper: pretend the server sent us this message.
+
+        If ``parsed`` is None and ``raw_bytes`` is valid JSON, we parse it
+        ourselves so test callers don't have to construct both forms."""
+        if parsed is None:
+            try:
+                import json as _json
+                parsed = _json.loads(raw_bytes)
+            except Exception:
+                parsed = None
         await self.on_message(
-            asset_ids, raw_bytes, datetime.now(timezone.utc), self.conn_id
+            asset_ids, raw_bytes, parsed, datetime.now(timezone.utc), self.conn_id
         )
 
     async def simulate_event(self, event: ConnectionEvent, extra: dict) -> None:
@@ -108,8 +118,8 @@ class CapturingHandler:
         self.messages: list = []
         self.events: list = []
 
-    async def on_message(self, asset_ids, raw_bytes, ts_recv, conn_id):
-        self.messages.append((asset_ids, raw_bytes, ts_recv, conn_id))
+    async def on_message(self, asset_ids, raw_bytes, parsed, ts_recv, conn_id):
+        self.messages.append((asset_ids, raw_bytes, parsed, ts_recv, conn_id))
 
     async def on_event(self, conn_id, event, extra):
         self.events.append((conn_id, event, extra))
@@ -244,9 +254,11 @@ class TestDispatch:
             conn = MockWSConnection.instances[0]
             await conn.simulate_message(("a1",), b'{"event_type":"book","asset_id":"a1"}')
             assert len(h.messages) == 1
-            asset_ids, raw_bytes, _, conn_id = h.messages[0]
+            asset_ids, raw_bytes, parsed, _, conn_id = h.messages[0]
             assert asset_ids == ("a1",)
             assert raw_bytes == b'{"event_type":"book","asset_id":"a1"}'
+            # MockWSConnection auto-parses raw_bytes when parsed=None
+            assert parsed == {"event_type": "book", "asset_id": "a1"}
             assert conn_id == 0
         finally:
             await pool.stop()

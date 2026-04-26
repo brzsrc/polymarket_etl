@@ -34,19 +34,16 @@ async def main() -> None:
     asset_counter = Counter()
     raw_bytes_total = 0
 
-    async def on_msg(asset_ids, raw_bytes, ts_recv: datetime, conn_id: int):
+    async def on_msg(asset_ids, raw_bytes, parsed, ts_recv: datetime, conn_id: int):
         nonlocal raw_bytes_total
-        # We can cheaply peek event_type without full parse for stats
-        try:
-            import json
-            data = json.loads(raw_bytes)
-            if isinstance(data, list):
-                for d in data:
-                    msg_counter[d.get("event_type", "?")] += 1
-            else:
-                msg_counter[data.get("event_type", "?")] += 1
-        except Exception:
+        # `parsed` arrives pre-decoded — no need to call json.loads here.
+        if parsed is None:
             msg_counter["<malformed>"] += 1
+        elif isinstance(parsed, list):
+            for d in parsed:
+                msg_counter[d.get("event_type", "?")] += 1
+        else:
+            msg_counter[parsed.get("event_type", "?")] += 1
         for a in asset_ids:
             asset_counter[a] += 1
         raw_bytes_total += len(raw_bytes)

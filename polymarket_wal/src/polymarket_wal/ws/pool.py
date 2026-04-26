@@ -43,6 +43,7 @@ from .connection import (
     ConnectionEvent,
     EventHandler,
     MessageHandler,
+    ParsedMessage,
     WSConnection,
 )
 
@@ -296,6 +297,7 @@ class WSPool:
         self,
         asset_ids: tuple[str, ...],
         raw_bytes: bytes,
+        parsed: "ParsedMessage | None",
         ts_recv: datetime,
         conn_id: int,
     ) -> None:
@@ -315,7 +317,9 @@ class WSPool:
         behavior is "forward everything".
         """
         try:
-            await self._on_message_external(asset_ids, raw_bytes, ts_recv, conn_id)
+            await self._on_message_external(
+                asset_ids, raw_bytes, parsed, ts_recv, conn_id
+            )
         except Exception:
             logger.exception("on_message handler raised")
 

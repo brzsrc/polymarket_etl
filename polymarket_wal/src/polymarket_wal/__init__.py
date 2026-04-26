@@ -12,9 +12,12 @@ from .models import Market, parse_market
 from .ws import (
     ConnectionEvent,
     MessageHandler,
+    ParsedMessage,
     WSConnection,
     WSPool,
+    asset_ids_from_parsed,
     extract_asset_ids,
+    parse_message,
 )
 
 __all__ = [
@@ -27,11 +30,14 @@ __all__ = [
     "Market",
     "MarketsJsonlWriter",
     "MessageHandler",
+    "ParsedMessage",
     "WSConnection",
     "WSPool",
+    "asset_ids_from_parsed",
     "extract_asset_ids",
     "extract_token_ids",
     "fetch_all_active_binary_markets",
     "is_tradeable_binary_market",
     "parse_market",
+    "parse_message",
 ]

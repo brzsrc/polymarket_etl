@@ -39,7 +39,7 @@ import random
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from enum import Enum
-
+from ..utilities import now_ns
 import msgspec
 import websockets
 from websockets.asyncio.client import ClientConnection
@@ -68,7 +68,6 @@ RECONNECT_BACKOFF_MAX_SEC = 30.0
 
 class ConnectionEvent(str, Enum):
     """Lifecycle events the pool / metrics layer wants to observe."""
-
     CONNECTED = "connected"
     SUBSCRIBED = "subscribed"
     DISCONNECTED = "disconnected"
@@ -77,35 +76,14 @@ class ConnectionEvent(str, Enum):
     CLOSED = "closed"  # final, not retrying
 
 
-# Type alias: callback signature.
-# - asset_ids: which assets this message pertains to. A price_change can
-#   touch multiple assets in one message; book / new_market touch one.
-# - raw_bytes: the original WS frame, unmodified. Useful if the consumer
-#   wants to compute byte-level hashes or pass through to compression.
-# - parsed: the same message decoded as a Python dict (or list, for the
-#   initial subscription response). Provided alongside raw_bytes so
-#   downstream consumers (e.g. the WAL writer) don't have to re-parse.
-#
-#   Why both? We have to parse internally to extract asset_ids for
-#   routing, so the parsed object is "free" — handing it to the consumer
-#   saves them a JSON decode (~1-2µs/message). Polymarket's protocol uses
-#   string-typed numerics (price/size/timestamp/asset_id all strings), so
-#   a roundtrip through dict and back to JSON is value-preserving — only
-#   whitespace and (less commonly) field order may differ. The hash field
-#   on book messages is computed over book state, not message bytes, so
-#   that whitespace doesn't affect verification either.
-#
-# - ts_recv: when WE received it (datetime, UTC).
-# - conn_id: which connection delivered it (forensic — lets researchers
-#   identify gaps caused by reconnects on a particular shard).
-MessageHandler = Callable[
-    [tuple[str, ...], bytes, "ParsedMessage", datetime, int],
-    Awaitable[None],
-]
-
 # A parsed Polymarket message: usually a dict, but the initial subscription
 # response is a list of book snapshots.
 ParsedMessage = dict | list
+
+MessageHandler = Callable[
+    [tuple[str, ...], bytes, ParsedMessage, int, int],
+    Awaitable[None],
+]
 
 # Optional callback for connection lifecycle (logging / metrics / persistence
 # of "I reconnected" markers in the WAL).
@@ -113,45 +91,6 @@ EventHandler = Callable[
     [int, ConnectionEvent, dict],  # conn_id, event, extra context
     Awaitable[None],
 ]
-
-
-# ---------------------------------------------------------------------------
-# Parsing & asset_id extraction
-# ---------------------------------------------------------------------------
-
-# Polymarket WS messages can be either a single object or a list (the initial
-# subscription response is a list of book snapshots). Both cases are valid.
-#
-# Layout per event_type, based on April 2026 protocol observation:
-#
-#   book              top-level "asset_id"
-#   price_change      "price_changes" array, each entry has "asset_id"  (CAN BE MULTIPLE)
-#   tick_size_change  top-level "asset_id"
-#   last_trade_price  top-level "asset_id"
-#   best_bid_ask      top-level "asset_id"   (custom_feature_enabled)
-#   new_market        top-level "asset_id" (and "market")  (custom_feature_enabled)
-#   market_resolved   top-level "asset_id" or no asset (event-level)
-#
-# We don't trust event_type to be present (some old messages omit it). Instead
-# we look for the fields directly, which is robust to event_type being missing
-# or to new event_types being added.
-
-_msgpack_decoder = msgspec.json.Decoder()
-
-
-def parse_message(raw_bytes: bytes) -> ParsedMessage | None:
-    """
-    Decode a WS message body. Returns None on malformed JSON.
-
-    msgspec.json.decode is ~5x faster than json.loads for our payload
-    sizes. We do this once at receive time and pass the result to the
-    handler, so downstream WAL writers don't have to decode again.
-    """
-    try:
-        return _msgpack_decoder.decode(raw_bytes)
-    except msgspec.DecodeError:
-        return None
-
 
 def asset_ids_from_parsed(parsed: ParsedMessage) -> tuple[str, ...]:
     """
@@ -189,27 +128,6 @@ def asset_ids_from_parsed(parsed: ParsedMessage) -> tuple[str, ...]:
     return tuple(seen)
 
 
-def extract_asset_ids(raw_bytes: bytes) -> tuple[str, ...]:
-    """
-    Convenience: parse and extract in one call.
-
-    Kept for the rare case where a caller has bytes but no need for the
-    parsed object. Equivalent to::
-
-        parsed = parse_message(raw_bytes)
-        return asset_ids_from_parsed(parsed) if parsed is not None else ()
-    """
-    parsed = parse_message(raw_bytes)
-    if parsed is None:
-        return ()
-    return asset_ids_from_parsed(parsed)
-
-
-# ---------------------------------------------------------------------------
-# WSConnection
-# ---------------------------------------------------------------------------
-
-
 class WSConnection:
     """
     A single managed WS connection.
@@ -229,45 +147,30 @@ class WSConnection:
         conn_id: int,
         on_message: MessageHandler,
         on_event: EventHandler | None = None,
-        ws_url: str = WS_URL,
-        ping_interval_sec: float = PING_INTERVAL_SEC,
-        data_idle_timeout_sec: float = DATA_IDLE_TIMEOUT_SEC,
     ) -> None:
         self._conn_id = conn_id
+        self._url = WS_URL
+        self._ping_interval = PING_INTERVAL_SEC
+        self._data_idle_timeout = DATA_IDLE_TIMEOUT_SEC
+
         self._on_message = on_message
         self._on_event = on_event
-        self._url = ws_url
-        self._ping_interval = ping_interval_sec
-        self._data_idle_timeout = data_idle_timeout_sec
 
         # Subscription state (source of truth; survives reconnects)
         self._subscriptions: set[str] = set()
         # Lock guards mutations to _subscriptions and the subscribe-send path
         self._sub_lock = asyncio.Lock()
 
-        # Live connection (None if not currently connected)
-        self._ws: ClientConnection | None = None
-
-        # Tracks last data-message receive time for watchdog. Bumped on any
-        # non-PONG inbound message.
+        self._stop_requested = False
+        self._force_disconnect = asyncio.Event()
+        # Tracks last data-message receive time for watchdog. Bumped on any non-PONG inbound message.
         self._last_data_msg_ts: float = 0.0
 
-        # Lifecycle control
-        self._stop_requested = False
-        # Set when current connection should be torn down (graceful path —
-        # external stop() or some future reason that's NOT a failure)
-        self._force_disconnect = asyncio.Event()
-        # Set by watchdog when it triggers a forced disconnect. The outer
-        # run() loop reads this to distinguish "abnormal reconnect needed"
-        # from "graceful close" — failure path increments attempt and emits
-        # RECONNECTING; graceful does neither.
-        self._watchdog_triggered = False
+        # msgspec is dramatically faster than stdlib json for our payload size.
+        self._json_decoder = msgspec.json.Decoder()
 
-        # Task handles for the duration of one connection
-        self._ping_task: asyncio.Task | None = None
-        self._watchdog_task: asyncio.Task | None = None
-
-    # ---- public state ----
+        # Live connection (None if not currently connected)
+        self._ws: ClientConnection | None = None
 
     @property
     def conn_id(self) -> int:
@@ -280,7 +183,10 @@ class WSConnection:
     def has_subscription(self, asset_id: str) -> bool:
         return asset_id in self._subscriptions
 
-    # ---- mutating subscription set ----
+    def stop(self) -> None:
+        """Signal the connection to terminate at the next opportunity."""
+        self._stop_requested = True
+        self._force_disconnect.set()
 
     async def add_subscriptions(self, asset_ids: list[str]) -> None:
         """
@@ -340,55 +246,25 @@ class WSConnection:
                 try:
                     await self._ws.send(msgspec.json.encode(msg).decode())
                 except ConnectionClosed:
+                    logger.debug("conn %d: remove subscribe lost (closed)", self._conn_id)
                     pass  # we're not subscribed anymore anyway
 
-    # ---- lifecycle ----
-
-    def stop(self) -> None:
-        """Signal the connection to terminate at the next opportunity."""
-        self._stop_requested = True
-        self._force_disconnect.set()
 
     async def run(self) -> None:
         """
         Main loop: connect → run → on disconnect retry. Returns when
         ``stop()`` has been called (after current iteration completes).
 
-        Each iteration of the outer loop is one connection lifetime. ``attempt``
-        counts CONSECUTIVE failures (resets to 0 on any iteration that
-        ``_connect_and_run`` returns normally).
-
-        Two distinct disconnect paths:
-
-        1. **Graceful close** (e.g. server cycled the connection on its own
-           schedule, or our watchdog asked for a clean reconnect). The
-           ``_connect_and_run`` call returns without raising. ``attempt``
-           stays at 0; we do NOT emit ``RECONNECTING`` and we don't sleep.
-           The next iteration just opens a new connection.
-
-        2. **Failure** (TCP error, DNS, server 5xx during handshake, etc).
-           ``_connect_and_run`` raises. We emit ``RECONNECTING`` and back
-           off before the retry. ``attempt`` increments.
-
-        This distinction matters for downstream monitoring: if every Cloudflare
-        long-poll cycle (~daily) emitted RECONNECTING, the metric would
-        confuse "we're having trouble" with "everything is fine, just
-        reconnecting on schedule".
+        Each iteration of the outer loop is one connection lifetime. Failures
+        are logged and we back off before retrying. The subscription set
+        persists across iterations.
         """
         attempt = 0
         while not self._stop_requested:
             try:
                 await self._connect_and_run()
-                # Connect-and-run returned without raising. Two sub-cases:
-                # - Watchdog triggered (silent freeze detected): treat as
-                #   failure so we back off and emit RECONNECTING.
-                # - Genuine graceful close (server cycled, our stop()): no
-                #   backoff, no RECONNECTING, just reconnect on next iter.
-                if self._watchdog_triggered:
-                    attempt += 1
-                    self._watchdog_triggered = False  # consumed
-                else:
-                    attempt = 0
+                # Normal end (server closed or stop requested)
+                attempt = 0
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -399,15 +275,15 @@ class WSConnection:
             if self._stop_requested:
                 break
 
-            # Only back off and emit RECONNECTING on actual failures.
-            # Graceful disconnects (attempt == 0) reconnect immediately.
-            if attempt > 0:
-                backoff = self._compute_backoff(attempt)
-                await self._emit_event(
-                    ConnectionEvent.RECONNECTING,
-                    {"attempt": attempt, "backoff_sec": backoff},
-                )
+            # Back off before reconnect
+            backoff = self._compute_backoff(attempt)
+            await self._emit_event(
+                ConnectionEvent.RECONNECTING, {"attempt": attempt, "backoff_sec": backoff}
+            )
+            try:
                 await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                raise
 
         await self._emit_event(ConnectionEvent.CLOSED, {})
 
@@ -479,9 +355,8 @@ class WSConnection:
         """
         loop = asyncio.get_event_loop()
         while True:
-            # Race the receive against an external disconnect signal.
-            # Using a regular ws.recv() with a wait_for is cleaner than
-            # a long poll loop.
+            # Race the receive against an external disconnect signal: 1.watchdog 2.stop() -> outside stop request
+            # Using a regular ws.recv() with a wait_for is cleaner than a long poll loop.
             recv_task = asyncio.create_task(ws.recv())
             disconnect_task = asyncio.create_task(self._force_disconnect.wait())
 
@@ -507,7 +382,7 @@ class WSConnection:
 
             # recv_task completed: either a message or an error
             try:
-                msg = recv_task.result()
+                raw = recv_task.result()
             except ConnectionClosed:
                 logger.info("conn %d: server closed connection", self._conn_id)
                 return
@@ -515,41 +390,31 @@ class WSConnection:
             # ts_recv is set as close to wire arrival as we can get it. We
             # record it BEFORE any further work (parsing, callback) so it
             # accurately represents arrival time for replay/research use.
-            ts_recv = datetime.now(timezone.utc)
+            ts_recv = now_ns()
 
-            # Normalize to bytes — websockets gives us str for text frames
-            # by default. We want bytes for the WAL "raw" path.
-            if isinstance(msg, str):
-                raw_bytes = msg.encode()
-                msg_str = msg
-            else:
-                raw_bytes = msg
-                # cheap check: PONG is 4 bytes
-                msg_str = msg.decode("utf-8", errors="replace") if len(msg) <= 8 else None
+            assert isinstance(raw, bytes)
 
             # PONG: don't bump data idle timer, don't forward
-            if msg_str == PONG_TEXT:
+            if raw == PONG_TEXT:
                 continue
 
             # Anything else counts as data activity for the watchdog.
             self._last_data_msg_ts = loop.time()
 
-            # Parse once. We need this for asset_id extraction (routing)
-            # anyway, and downstream consumers (WAL writer) want the parsed
-            # form too — passing it along saves them a redundant decode.
-            #
-            # If parsing fails (malformed JSON), we still forward the bytes
-            # with empty asset_ids and parsed=None. The WAL layer can decide
-            # whether to write malformed messages to disk; we don't drop them.
-            parsed = parse_message(raw_bytes)
+            try:
+                msg = self._json_decoder.decode(raw)
+            except msgspec.DecodeError:
+                msg = None
+
+            # Extract asset_ids for the dispatcher. May be empty (we don't
+            # know how to route) — we still forward, with empty tuple,
+            # because the WAL wants every byte regardless.
             asset_ids = (
-                asset_ids_from_parsed(parsed) if parsed is not None else ()
+                asset_ids_from_parsed(msg) if msg is not None else ()
             )
 
             try:
-                await self._on_message(
-                    asset_ids, raw_bytes, parsed, ts_recv, self._conn_id
-                )
+                await self._on_message(asset_ids, raw, msg, ts_recv, self._conn_id)
             except Exception:
                 logger.exception("conn %d: on_message handler raised", self._conn_id)
 
@@ -565,6 +430,7 @@ class WSConnection:
         except asyncio.CancelledError:
             raise
 
+
     async def _watchdog_loop(self) -> None:
         """
         Force-reconnect if data has been silent for too long.
@@ -577,7 +443,7 @@ class WSConnection:
         Checks every ``ping_interval`` seconds (cheap; piggy-backs on the
         cadence we already use).
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             while True:
                 await asyncio.sleep(self._ping_interval)
@@ -593,19 +459,10 @@ class WSConnection:
                         ConnectionEvent.WATCHDOG_TIMEOUT,
                         {"idle_sec": idle_for},
                     )
-                    self._watchdog_triggered = True
                     self._force_disconnect.set()
                     return
         except asyncio.CancelledError:
             raise
-
-    @staticmethod
-    def _compute_backoff(attempt: int) -> float:
-        """1s, 2s, 4s, 8s, 16s, 30s, 30s, ... with full jitter."""
-        if attempt <= 0:
-            return 0.0
-        base = min(2.0 ** (attempt - 1), RECONNECT_BACKOFF_MAX_SEC)
-        return random.uniform(0, base)
 
     async def _emit_event(self, event: ConnectionEvent, extra: dict) -> None:
         if self._on_event is None:
@@ -614,3 +471,11 @@ class WSConnection:
             await self._on_event(self._conn_id, event, extra)
         except Exception:
             logger.exception("conn %d: on_event handler raised", self._conn_id)
+
+    @staticmethod
+    def _compute_backoff(attempt: int) -> float:
+        """1s, 2s, 4s, 8s, 16s, 30s, 30s, ... with full jitter."""
+        if attempt <= 0:
+            return 0.0
+        base = min(2.0 ** (attempt - 1), RECONNECT_BACKOFF_MAX_SEC)
+        return random.uniform(0, base)

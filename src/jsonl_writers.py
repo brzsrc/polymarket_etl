@@ -58,7 +58,7 @@ class MarketsJsonlWriter:
             "raw": raw_record,
         }
         self._fh.write(self._encoder.encode(wrapper))
-        self._fh.write(b"\n\n")
+        self._fh.write(b"\n")
 
 async def fetch_all_active_binary_markets(
     client: GammaClient,

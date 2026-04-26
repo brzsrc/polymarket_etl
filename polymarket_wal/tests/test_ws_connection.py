@@ -107,17 +107,19 @@ class CapturingHandler:
     """Async callable that records every message it receives."""
 
     def __init__(self) -> None:
-        self.messages: list[tuple[tuple[str, ...], bytes, datetime, int]] = []
+        # (asset_ids, raw_bytes, parsed, ts_recv, conn_id)
+        self.messages: list = []
         self.events: list[tuple[int, ConnectionEvent, dict]] = []
 
     async def on_message(
         self,
         asset_ids: tuple[str, ...],
         raw_bytes: bytes,
+        parsed,
         ts_recv: datetime,
         conn_id: int,
     ) -> None:
-        self.messages.append((asset_ids, raw_bytes, ts_recv, conn_id))
+        self.messages.append((asset_ids, raw_bytes, parsed, ts_recv, conn_id))
 
     async def on_event(self, conn_id: int, event: ConnectionEvent, extra: dict) -> None:
         self.events.append((conn_id, event, extra))
@@ -224,10 +226,13 @@ class TestMessageReceive:
             await fake_server.push_to_all(json.dumps(book))
 
             await wait_for(lambda: len(handler.messages) >= 1, timeout=3)
-            asset_ids, raw_bytes, ts_recv, conn_id = handler.messages[0]
+            asset_ids, raw_bytes, parsed, ts_recv, conn_id = handler.messages[0]
             assert asset_ids == ("asset-1",)
             # Bytes must be the original — no parse/re-serialize round trip.
             assert json.loads(raw_bytes) == book
+            # The parsed dict is also forwarded so downstream consumers
+            # (like the WAL writer) don't have to decode again.
+            assert parsed == book
             assert isinstance(ts_recv, datetime)
             assert conn_id == 0
         finally:
@@ -255,7 +260,7 @@ class TestMessageReceive:
             # have gone through to the handler.
             assert all(
                 raw != b"PONG"
-                for _, raw, _, _ in handler.messages
+                for _, raw, _, _, _ in handler.messages
             )
         finally:
             conn.stop()
@@ -284,10 +289,13 @@ class TestMessageReceive:
             ]
             await fake_server.push_to_all(json.dumps(payload))
             await wait_for(lambda: len(handler.messages) >= 1, timeout=3)
-            asset_ids, raw_bytes, _, _ = handler.messages[0]
+            asset_ids, raw_bytes, parsed, _, _ = handler.messages[0]
             assert set(asset_ids) == {"a1", "a2"}
             # Single message in handler, not two
             assert len(handler.messages) == 1
+            # Parsed form preserves the list-of-dicts shape
+            assert isinstance(parsed, list)
+            assert len(parsed) == 2
         finally:
             conn.stop()
             await run_task
@@ -394,6 +402,85 @@ class TestWatchdogAndReconnect:
             second = json.loads(sub_msgs[1])
             assert set(second["assets_ids"]) == {"a1", "a2"}
             assert second["custom_feature_enabled"] is True
+        finally:
+            conn.stop()
+            await run_task
+
+    @pytest.mark.asyncio
+    async def test_graceful_server_close_does_not_emit_reconnecting(
+        self, fake_server
+    ):
+        """When the server closes the connection cleanly (e.g. Cloudflare's
+        scheduled long-connection cycle), we treat the next connect as a
+        continuation, NOT a retry. No RECONNECTING event, no backoff sleep.
+
+        Without this distinction, every Cloudflare cycle (~daily) would
+        spam RECONNECTING events and confuse monitoring."""
+        handler = CapturingHandler()
+        conn = WSConnection(
+            conn_id=0,
+            on_message=handler.on_message,
+            on_event=handler.on_event,
+            ws_url=fake_server.url,
+        )
+        run_task = asyncio.create_task(conn.run())
+        try:
+            await wait_for(lambda: len(fake_server.connections) > 0, timeout=3)
+            # Server closes cleanly (code 1000)
+            await fake_server.close_all(code=1000)
+            # Wait for the second CONNECTED event (i.e. reconnect happened)
+            await wait_for(
+                lambda: sum(
+                    1 for e in handler.events if e[1] == ConnectionEvent.CONNECTED
+                ) >= 2,
+                timeout=5,
+            )
+            # No RECONNECTING events should have been emitted between the
+            # two CONNECTED events
+            evt_seq = [e[1] for e in handler.events]
+            assert ConnectionEvent.RECONNECTING not in evt_seq, (
+                f"unexpected RECONNECTING in graceful-close path: {evt_seq}"
+            )
+        finally:
+            conn.stop()
+            await run_task
+
+    @pytest.mark.asyncio
+    async def test_watchdog_disconnect_emits_reconnecting(self, fake_server):
+        """In contrast to graceful close, a watchdog-triggered disconnect IS
+        a problem — we want monitoring to see it. Verify RECONNECTING is
+        emitted on this path."""
+        handler = CapturingHandler()
+        conn = WSConnection(
+            conn_id=0,
+            on_message=handler.on_message,
+            on_event=handler.on_event,
+            ws_url=fake_server.url,
+            ping_interval_sec=0.05,
+            data_idle_timeout_sec=0.3,
+        )
+        run_task = asyncio.create_task(conn.run())
+        try:
+            await wait_for(lambda: len(fake_server.connections) > 0, timeout=3)
+            # No data pushed → watchdog should fire
+            await wait_for(
+                lambda: any(
+                    e[1] == ConnectionEvent.WATCHDOG_TIMEOUT for e in handler.events
+                ),
+                timeout=3,
+            )
+            await wait_for(
+                lambda: any(
+                    e[1] == ConnectionEvent.RECONNECTING for e in handler.events
+                ),
+                timeout=3,
+            )
+            # Check the RECONNECTING event has attempt > 0
+            reconnect_evt = next(
+                e for e in handler.events if e[1] == ConnectionEvent.RECONNECTING
+            )
+            _, _, extra = reconnect_evt
+            assert extra["attempt"] >= 1
         finally:
             conn.stop()
             await run_task
