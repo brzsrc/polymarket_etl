@@ -120,7 +120,7 @@ async def main():
     async with GammaClient() as client:
         await fetch_all_active_binary_markets(
             client,
-            markets_jsonl_path=Path("markets2.jsonl"),
+            markets_jsonl_path=Path("../data/markets2.jsonl"),
         )
 
 if __name__ == "__main__":

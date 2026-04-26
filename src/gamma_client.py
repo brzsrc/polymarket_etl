@@ -125,7 +125,7 @@ async def main():
         print(f"拿到 {len(markets)} 个市场")
         for market, raw in markets[:5]:
             print(market.question)
-        with open("markets.jsonl", "wb") as f:
+        with open("../data/markets.jsonl", "wb") as f:
             f.write(b"\n".join(msgspec.json.encode(raw) for _, raw in markets))
 
 if __name__ == '__main__':
