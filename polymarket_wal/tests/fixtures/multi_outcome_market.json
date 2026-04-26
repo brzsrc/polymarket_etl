@@ -1,0 +1,18 @@
+{
+  "id": "999001",
+  "conditionId": "0xfakeconditionidforfivewaymarket",
+  "slug": "election-five-candidates",
+  "question": "Who will win the 2028 election?",
+  "outcomes": "[\"Alice\", \"Bob\", \"Carol\", \"Dave\", \"Eve\"]",
+  "clobTokenIds": "[\"111\", \"222\", \"333\", \"444\", \"555\"]",
+  "active": true,
+  "closed": false,
+  "archived": false,
+  "acceptingOrders": true,
+  "enableOrderBook": true,
+  "endDate": "2028-11-07T23:59:59Z",
+  "startDate": "2027-01-01T00:00:00Z",
+  "orderPriceMinTickSize": 0.01,
+  "orderMinSize": 5,
+  "negRisk": true
+}

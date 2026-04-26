@@ -1,0 +1,17 @@
+{
+  "id": "999004",
+  "conditionId": "0xfakeconditionwitharrayfields",
+  "slug": "future-format-market",
+  "question": "What if Gamma starts returning real arrays?",
+  "outcomes": ["Yes", "No"],
+  "clobTokenIds": ["12345", "67890"],
+  "active": true,
+  "closed": false,
+  "archived": false,
+  "acceptingOrders": true,
+  "enableOrderBook": true,
+  "endDate": "2026-12-31T23:59:59Z",
+  "orderPriceMinTickSize": 0.01,
+  "orderMinSize": 5,
+  "negRisk": false
+}

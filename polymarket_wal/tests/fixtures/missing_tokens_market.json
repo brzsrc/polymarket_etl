@@ -1,0 +1,13 @@
+{
+  "id": "999002",
+  "conditionId": "0xfakeconditionwithoutclobtokens",
+  "slug": "broken-market-no-tokens",
+  "question": "This market wasn't fully configured",
+  "outcomes": "[\"Yes\", \"No\"]",
+  "active": true,
+  "closed": false,
+  "archived": false,
+  "acceptingOrders": true,
+  "enableOrderBook": true,
+  "endDate": "2026-12-31T23:59:59Z"
+}

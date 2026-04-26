@@ -1,0 +1,17 @@
+{
+  "id": "999003",
+  "conditionId": "0xfakeconditionnotaccepting",
+  "slug": "paused-market",
+  "question": "This market is technically active but paused",
+  "outcomes": "[\"Yes\", \"No\"]",
+  "clobTokenIds": "[\"77777777\", \"88888888\"]",
+  "active": true,
+  "closed": false,
+  "archived": false,
+  "acceptingOrders": false,
+  "enableOrderBook": true,
+  "endDate": "2026-06-30T23:59:59Z",
+  "orderPriceMinTickSize": 0.01,
+  "orderMinSize": 5,
+  "negRisk": false
+}
