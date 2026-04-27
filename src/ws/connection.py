@@ -68,12 +68,18 @@ RECONNECT_BACKOFF_MAX_SEC = 30.0
 
 class ConnectionEvent(str, Enum):
     """Lifecycle events the pool / metrics layer wants to observe."""
+    # in connected state
     CONNECTED = "connected"
+    # msg just sent to ws
     SUBSCRIBED = "subscribed"
+    # disconnected which gonna cause retrying
     DISCONNECTED = "disconnected"
+    # reconnecting
     RECONNECTING = "reconnecting"
-    WATCHDOG_TIMEOUT = "watchdog_timeout"  # idle too long, forcing reconnect
-    CLOSED = "closed"  # final, not retrying
+    # idle too long, forcing reconnect
+    WATCHDOG_TIMEOUT = "watchdog_timeout"
+    # final, not retrying
+    CLOSED = "closed"
 
 
 # A parsed Polymarket message: usually a dict, but the initial subscription
@@ -252,137 +258,182 @@ class WSConnection:
 
     async def run(self) -> None:
         """
-        Main loop: connect → run → on disconnect retry. Returns when
-        ``stop()`` has been called (after current iteration completes).
+        Main loop: connect → run one connection → on disconnect retry.
+        Returns when ``stop()`` has been called.
 
-        Each iteration of the outer loop is one connection lifetime. Failures
-        are logged and we back off before retrying. The subscription set
-        persists across iterations.
+        Each iteration of the outer ``while`` is one connection lifetime.
+        Within a single iteration:
+        - websockets.connect manages the TCP/TLS/WS handshake
+        - we send the subscribe message (custom_feature_enabled=True)
+        - three concurrent tasks run for the connection's life:
+            * ping_loop      — sends "PING" every 10s
+            * watchdog_loop  — sets _force_disconnect if data is idle too long
+            * receive_loop   — reads frames, dispatches to handler
+        - we await on either receive_loop finishing OR _force_disconnect
+          being set, whichever happens first.
+
+        Three exit categories from one connection iteration:
+
+        1. **Graceful** — server cycled the connection cleanly (long-poll
+           timeout, scheduled rotation), OR our stop() was called. The
+           connection ended without a real failure: ``attempt`` is reset,
+           no RECONNECTING event, no backoff. Reconnects immediately on
+           next iteration (unless stop() — then we exit).
+
+        2. **Watchdog** — the connection looked alive (PING/PONG OK) but
+           no data was flowing. This is a real failure of the underlying
+           stream even though no exception was raised. Treat as retry:
+           ``attempt`` increments, RECONNECTING fires, backoff applied.
+
+        3. **Exception** — TCP error, DNS failure, server 5xx during
+           handshake, recv_task raising mid-stream, etc. Treated the same
+           as Watchdog from the retry perspective.
+
         """
         attempt = 0
         while not self._stop_requested:
             try:
-                await self._connect_and_run()
-                # Normal end (server closed or stop requested)
-                attempt = 0
+                # ---- one connection's lifetime ----
+                self._force_disconnect.clear()
+
+                async with websockets.connect(
+                    self._url,
+                    ping_interval=None,
+                    close_timeout=5,
+                ) as ws:
+                    self._ws = ws
+                    self._last_data_msg_ts = asyncio.get_event_loop().time()
+
+                    await self._emit_event(ConnectionEvent.CONNECTED, {})
+
+                    # Send initial subscription. If subscriptions is empty
+                    # (rare; pool creates a connection slightly before
+                    # adding), we still need to send something — empty list.
+                    async with self._sub_lock:
+                        initial_subs = list(self._subscriptions)
+
+                    init_msg = {
+                        "type": "market",
+                        "assets_ids": initial_subs,
+                        # custom_feature_enabled controls whether we also
+                        # receive new_market, market_resolved, and
+                        # best_bid_ask events. We always want these.
+                        "custom_feature_enabled": True,
+                    }
+                    await ws.send(msgspec.json.encode(init_msg).decode())
+                    await self._emit_event(
+                        ConnectionEvent.SUBSCRIBED,
+                        {"asset_count": len(initial_subs)},
+                    )
+
+                    # Spawn ping + watchdog + receive tasks.
+                    self._ping_task = asyncio.create_task(self._ping_loop(ws))
+                    self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+
+                    recv_task = asyncio.create_task(self._receive_loop(ws))
+                    disconnect_task = asyncio.create_task(
+                        self._force_disconnect.wait()
+                    )
+
+                    try:
+                        done, _pending = await asyncio.wait(
+                            {recv_task, disconnect_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+
+                        if disconnect_task in done:
+                            # External disconnect (stop() or watchdog)
+                            try:
+                                await ws.close(code=1000)
+                            # any error happends during ws.close shouldn't matter
+                            except Exception:
+                                pass
+                            try:
+                                await recv_task
+                            except Exception:
+                                logger.exception(
+                                    "conn %d: receive_loop raised abnormal errors during shutdown",
+                                    self._conn_id,
+                                )
+                        else:
+                            # recv_task finished first. If it raised,
+                            # propagate to the outer except so we treat
+                            # this iteration as a failure.
+                            exc = recv_task.exception()
+                            if exc is not None:
+                                raise exc
+                    finally:
+                        # Tear down all side tasks. Cancel is idempotent.
+                        for t in (recv_task, disconnect_task,
+                                  self._ping_task, self._watchdog_task):
+                            if t and not t.done():
+                                t.cancel()
+                        for t in (recv_task, disconnect_task,
+                                  self._ping_task, self._watchdog_task):
+                            if t:
+                                try:
+                                    await t
+                                except (asyncio.CancelledError, Exception):
+                                    pass
+                        self._ping_task = None
+                        self._watchdog_task = None
+                        self._ws = None
+
+                    await self._emit_event(ConnectionEvent.DISCONNECTED, {})
+
+                # ---- end of one connection (with 1 ws:) —> decide retry policy ----
+                # - _force_disconnect set + _stop_requested → stop() (graceful)
+                # - _force_disconnect set + NOT _stop_requested → watchdog
+                # - _force_disconnect not set → server closed cleanly
+                if (
+                    self._force_disconnect.is_set()
+                    and not self._stop_requested
+                ):
+                    # Watchdog detected a stalled stream — real failure.
+                    attempt += 1
+                else:
+                    # Server cycled us, or stop() was called.
+                    attempt = 0
+            # either run get cancelled or somehow receive/ping/watchdog_loop get cancelled
             except asyncio.CancelledError:
                 raise
             except Exception:
-                # Includes connection refused, DNS failure, mid-stream errors.
+                # Network error, protocol error, etc.
                 logger.exception("conn %d: connection error", self._conn_id)
                 attempt += 1
 
             if self._stop_requested:
                 break
 
-            # Back off before reconnect
-            backoff = self._compute_backoff(attempt)
-            await self._emit_event(
-                ConnectionEvent.RECONNECTING, {"attempt": attempt, "backoff_sec": backoff}
-            )
-            try:
+            # Only back off and emit RECONNECTING on actual failures.
+            if attempt > 0:
+                backoff = self._compute_backoff(attempt)
+                await self._emit_event(
+                    ConnectionEvent.RECONNECTING,
+                    {"attempt": attempt, "backoff_sec": backoff},
+                )
                 await asyncio.sleep(backoff)
-            except asyncio.CancelledError:
-                raise
 
         await self._emit_event(ConnectionEvent.CLOSED, {})
 
-    async def _connect_and_run(self) -> None:
-        """One connection's lifetime."""
-        # ``ping_interval=None`` disables the websockets library's WS-level
-        # ping (we use our own application-level "PING"/"PONG" strings).
-        async with websockets.connect(
-            self._url,
-            ping_interval=None,
-            close_timeout=5,
-        ) as ws:
-            self._ws = ws
-            self._force_disconnect.clear()
-            self._last_data_msg_ts = asyncio.get_event_loop().time()
-
-            await self._emit_event(ConnectionEvent.CONNECTED, {})
-
-            # Send initial subscription. If subscriptions is empty (rare; pool
-            # creates a connection slightly before adding), we still need to
-            # send something, so we send an empty asset list.
-            async with self._sub_lock:
-                initial_subs = list(self._subscriptions)
-
-            init_msg = {
-                "type": "market",
-                "assets_ids": initial_subs,
-                # KEY: custom_feature_enabled controls whether we also receive
-                # new_market, market_resolved, and best_bid_ask events. We
-                # always want these.
-                "custom_feature_enabled": True,
-            }
-            await ws.send(msgspec.json.encode(init_msg).decode())
-            await self._emit_event(
-                ConnectionEvent.SUBSCRIBED, {"asset_count": len(initial_subs)}
-            )
-
-            # Spawn ping + watchdog tasks for the duration of this connection
-            self._ping_task = asyncio.create_task(self._ping_loop(ws))
-            self._watchdog_task = asyncio.create_task(self._watchdog_loop())
-
-            try:
-                await self._receive_loop(ws)
-            finally:
-                # Tear down side tasks
-                for t in (self._ping_task, self._watchdog_task):
-                    if t and not t.done():
-                        t.cancel()
-                # Wait for them to actually finish, ignoring cancel
-                for t in (self._ping_task, self._watchdog_task):
-                    if t:
-                        try:
-                            await t
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                self._ping_task = None
-                self._watchdog_task = None
-                self._ws = None
-
-            await self._emit_event(ConnectionEvent.DISCONNECTED, {})
-
     async def _receive_loop(self, ws: ClientConnection) -> None:
         """
-        Read messages until disconnection.
+        Read messages until the connection ends.
 
         Filters out PONG (heartbeat reply) since the watchdog only cares
-        about *data* idleness. Bumps last_data_msg_ts on any other message
-        and forwards via on_message.
+        about *data* idleness. Bumps ``_last_data_msg_ts`` on any other
+        message and forwards via on_message.
+
+        Returns normally when the server closes the connection (or our own
+        ``ws.close()`` from the outer task triggers ConnectionClosed via
+        the in-flight recv). External disconnect signals (stop / watchdog)
+        are handled in ``_connect_and_run`` — this function is just a
+        straight read loop.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         while True:
-            # Race the receive against an external disconnect signal: 1.watchdog 2.stop() -> outside stop request
-            # Using a regular ws.recv() with a wait_for is cleaner than a long poll loop.
-            recv_task = asyncio.create_task(ws.recv())
-            disconnect_task = asyncio.create_task(self._force_disconnect.wait())
-
-            done, pending = await asyncio.wait(
-                {recv_task, disconnect_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for p in pending:
-                p.cancel()
-                try:
-                    await p
-                except (asyncio.CancelledError, Exception):
-                    pass
-
-            if disconnect_task in done:
-                # External shutdown or watchdog asked us to disconnect.
-                # Closing the ws ends the outer ``async with``.
-                try:
-                    await ws.close(code=1000)
-                except Exception:
-                    pass
-                return
-
-            # recv_task completed: either a message or an error
             try:
-                raw = recv_task.result()
+                raw = await ws.recv()
             except ConnectionClosed:
                 logger.info("conn %d: server closed connection", self._conn_id)
                 return
@@ -413,22 +464,19 @@ class WSConnection:
                 asset_ids_from_parsed(msg) if msg is not None else ()
             )
 
-            try:
-                await self._on_message(asset_ids, raw, msg, ts_recv, self._conn_id)
-            except Exception:
-                logger.exception("conn %d: on_message handler raised", self._conn_id)
+            await self._on_message(asset_ids, raw, msg, ts_recv, self._conn_id)
+
+
 
     async def _ping_loop(self, ws: ClientConnection) -> None:
         """Send PING every ``ping_interval`` seconds."""
-        try:
-            while True:
-                await asyncio.sleep(self._ping_interval)
-                try:
-                    await ws.send(PING_TEXT)
-                except ConnectionClosed:
-                    return
-        except asyncio.CancelledError:
-            raise
+        while True:
+            await asyncio.sleep(self._ping_interval)
+            try:
+                await ws.send(PING_TEXT)
+            except ConnectionClosed:
+                return
+
 
 
     async def _watchdog_loop(self) -> None:
@@ -444,25 +492,19 @@ class WSConnection:
         cadence we already use).
         """
         loop = asyncio.get_running_loop()
-        try:
-            while True:
-                await asyncio.sleep(self._ping_interval)
-                idle_for = loop.time() - self._last_data_msg_ts
-                if idle_for > self._data_idle_timeout:
-                    logger.warning(
-                        "conn %d: watchdog timeout (idle %.0fs > %.0fs), forcing reconnect",
-                        self._conn_id,
-                        idle_for,
-                        self._data_idle_timeout,
-                    )
-                    await self._emit_event(
-                        ConnectionEvent.WATCHDOG_TIMEOUT,
-                        {"idle_sec": idle_for},
-                    )
-                    self._force_disconnect.set()
-                    return
-        except asyncio.CancelledError:
-            raise
+        while True:
+            await asyncio.sleep(self._ping_interval)
+            idle_for = loop.time() - self._last_data_msg_ts
+            if idle_for > self._data_idle_timeout:
+                logger.warning(
+                    "conn %d: watchdog timeout (idle %.0fs > %.0fs), force disconnect first then force reconnect",
+                    self._conn_id,
+                    idle_for,
+                    self._data_idle_timeout,
+                )
+                self._force_disconnect.set()
+                return
+
 
     async def _emit_event(self, event: ConnectionEvent, extra: dict) -> None:
         if self._on_event is None:
