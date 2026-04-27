@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 import msgspec
-from models import Market, parse_binary_market
+from .models import Market, parse_binary_market
 
 GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
 

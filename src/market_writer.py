@@ -60,6 +60,8 @@ class MarketsJsonlWriter:
         self._fh.write(self._encoder.encode(wrapper))
         self._fh.write(b"\n")
 
+
+
 async def fetch_all_active_binary_markets(
     client: GammaClient,
     markets_jsonl_path: Path | None = None,

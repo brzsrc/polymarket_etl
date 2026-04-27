@@ -87,7 +87,7 @@ class ConnectionEvent(str, Enum):
 ParsedMessage = dict | list
 
 MessageHandler = Callable[
-    [tuple[str, ...], bytes, ParsedMessage, int, int],
+    [tuple[str, ...], str, ParsedMessage, int, int],
     Awaitable[None],
 ]
 
@@ -397,7 +397,7 @@ class WSConnection:
                 else:
                     # Server cycled us, or stop() was called.
                     attempt = 0
-            # either run get cancelled or somehow receive/ping/watchdog_loop get cancelled
+            # somehow receive/ping/watchdog_loop get cancelled
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -446,7 +446,7 @@ class WSConnection:
             # accurately represents arrival time for replay/research use.
             ts_recv = now_ns()
 
-            assert isinstance(raw, bytes)
+            assert isinstance(raw, str)
 
             # PONG: don't bump data idle timer, don't forward
             if raw == PONG_TEXT:
