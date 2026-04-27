@@ -153,11 +153,14 @@ class WSConnection:
         conn_id: int,
         on_message: MessageHandler,
         on_event: EventHandler | None = None,
+        ws_url: str = WS_URL,
+        ping_interval_sec: float = PING_INTERVAL_SEC,
+        data_idle_timeout_sec: float = DATA_IDLE_TIMEOUT_SEC,
     ) -> None:
         self._conn_id = conn_id
-        self._url = WS_URL
-        self._ping_interval = PING_INTERVAL_SEC
-        self._data_idle_timeout = DATA_IDLE_TIMEOUT_SEC
+        self._url = ws_url
+        self._ping_interval = ping_interval_sec
+        self._data_idle_timeout = data_idle_timeout_sec
 
         self._on_message = on_message
         self._on_event = on_event
@@ -497,10 +500,14 @@ class WSConnection:
             idle_for = loop.time() - self._last_data_msg_ts
             if idle_for > self._data_idle_timeout:
                 logger.warning(
-                    "conn %d: watchdog timeout (idle %.0fs > %.0fs), force disconnect first then force reconnect",
+                    "conn %d: watchdog timeout (idle %.1fs > %.1fs), force disconnect then reconnect",
                     self._conn_id,
                     idle_for,
                     self._data_idle_timeout,
+                )
+                await self._emit_event(
+                    ConnectionEvent.WATCHDOG_TIMEOUT,
+                    {"idle_sec": idle_for},
                 )
                 self._force_disconnect.set()
                 return
