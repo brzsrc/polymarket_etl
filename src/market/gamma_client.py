@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import logging
-import random
 from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
 import msgspec
-from .models import Market, parse_binary_market
+from src.market.models import Market, parse_binary_market
 
 GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
 
@@ -67,7 +65,7 @@ class GammaClient:
                 f"Gamma returned {resp.status_code}: {resp.text[:200]}"
             )
 
-    async def iter_markets(self) -> AsyncIterator[tuple[Market, dict[str, Any]]]:
+    async def iter_all_markets(self) -> AsyncIterator[tuple[Market, dict[str, Any]]]:
         """
         Iterate over all markets matching the given filters, handling
         pagination internally.
@@ -113,10 +111,40 @@ class GammaClient:
 
             offset += self._page_size
 
+    async def iter_markets(self, size: int, offset: int) -> AsyncIterator[tuple[Market, dict[str, Any]]]:
+        while size > 0:
+            limit = min(size, self._page_size)
+            params: dict[str, Any] = {
+                "limit": limit,
+                "offset": offset,
+                # Booleans are sent as "true"/"false" strings; httpx handles this.
+                "active": "true",
+                "closed": "false",
+                "archived": "false",
+                "enable_order_book": "true",
+            }
+
+            page = await self._get_page(params)
+
+            if not page:
+                # Empty page = we've reached the end. Gamma doesn't return a
+                # total count, so this is the only way to know.
+                return
+
+            for raw in page:
+                market = parse_binary_market(raw)
+                if market is None:
+                    continue
+                yield market, raw
+
+            offset += limit
+            size -= limit
+
+
 
     async def fetch_all_markets(self) -> list[tuple[Market, dict[str, Any]]]:
         """Convenience: collect all markets into a list. ~45k records, a few MB."""
-        return [pair async for pair in self.iter_markets()]
+        return [pair async for pair in self.iter_all_markets()]
 
 
 async def main():
@@ -125,7 +153,7 @@ async def main():
         print(f"拿到 {len(markets)} 个市场")
         for market, raw in markets[:5]:
             print(market.question)
-        with open("../data/markets.jsonl", "wb") as f:
+        with open("../../data/markets.jsonl", "wb") as f:
             f.write(b"\n".join(msgspec.json.encode(raw) for _, raw in markets))
 
 if __name__ == '__main__':

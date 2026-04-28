@@ -1,65 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import logging
-from collections.abc import Iterable
-from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 
-import msgspec
-
-from src.gamma_client import GammaClient
-from src.models import Market
+from src.market.gamma_client import GammaClient
+from src.market.models import Market, MarketsJsonlWriter
 from src.utilities import now_ns
-
-
-class MarketsJsonlWriter:
-    """
-    Append-only JSONL writer for market metadata.
-
-    Not thread-safe; intended to be called from a single asyncio task. We
-    keep a single file handle open for the lifetime of the writer (one cycle
-    typically writes ~30k lines, no point reopening).
-
-    Use as a context manager so the file gets closed and fsynced on exit.
-    """
-
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._fh = None
-        # msgspec encoder is reusable and faster than json.dumps.
-        self._encoder = msgspec.json.Encoder()
-
-    def __enter__(self) -> "MarketsJsonlWriter":
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        # Append mode in binary so msgspec.encode (returns bytes) writes
-        # without an extra encoding step.
-        self._fh = self._path.open("ab")
-        return self
-
-    def __exit__(self, *_exc) -> None:
-        if self._fh is not None:
-            self._fh.flush()
-            # fsync ensures the kernel actually flushes to disk. For a
-            # discovery cycle that runs every 5-10 min, the cost (~ms) is
-            # noise. For a 60s WAL writer in Phase 3 we'll be more careful.
-            import os
-            os.fsync(self._fh.fileno())
-            self._fh.close()
-            self._fh = None
-
-    def write(self, ts_recv_ns: int, raw_record: dict) -> None:
-        if self._fh is None:
-            raise RuntimeError("Writer not opened (use as context manager)")
-        wrapper = {
-            "ts_recv_ns": ts_recv_ns,
-            "raw": raw_record,
-        }
-        self._fh.write(self._encoder.encode(wrapper))
-        self._fh.write(b"\n")
-
 
 
 async def fetch_all_active_binary_markets(
@@ -101,7 +47,7 @@ async def fetch_all_active_binary_markets(
     writer_ctx = MarketsJsonlWriter(markets_jsonl_path)
 
     with writer_ctx as writer:
-        async for market, raw in client.iter_markets():
+        async for market, raw in client.iter_all_markets():
             # raw_records_seen += 1
             # duoble check all markets are valid
             # if not is_tradeable_binary_market(market):
@@ -122,7 +68,7 @@ async def main():
     async with GammaClient() as client:
         await fetch_all_active_binary_markets(
             client,
-            markets_jsonl_path=Path("../data/markets2.jsonl"),
+            markets_jsonl_path=Path("../../data/markets2.jsonl"),
         )
 
 if __name__ == "__main__":
