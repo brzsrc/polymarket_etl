@@ -107,22 +107,31 @@ def asset_ids_from_parsed(parsed: ParsedMessage) -> tuple[str, ...]:
     message type we don't route on.
 
     Returns deduplicated, order-preserved asset_ids.
+
+    Polymarket schema gotcha: most events use ``asset_id`` (singular,
+    string) at the top level, but ``new_market`` events use ``assets_ids``
+    (plural, array). We support both.
     """
     seen: list[str] = []
 
+    def _add(aid) -> None:
+        if isinstance(aid, str) and aid and aid not in seen:
+            seen.append(aid)
+
     def _from_obj(obj: dict) -> None:
-        # Top-level asset_id covers most types
-        top = obj.get("asset_id")
-        if isinstance(top, str) and top and top not in seen:
-            seen.append(top)
-        # price_change has a price_changes[] array
+        # Most events: top-level "asset_id" (singular, string)
+        _add(obj.get("asset_id"))
+        # new_market events: top-level "assets_ids" (plural, array of strings)
+        ass = obj.get("assets_ids")
+        if isinstance(ass, list):
+            for aid in ass:
+                _add(aid)
+        # price_change events: "price_changes" array, each with asset_id
         pcs = obj.get("price_changes")
         if isinstance(pcs, list):
             for pc in pcs:
                 if isinstance(pc, dict):
-                    aid = pc.get("asset_id")
-                    if isinstance(aid, str) and aid and aid not in seen:
-                        seen.append(aid)
+                    _add(pc.get("asset_id"))
 
     if isinstance(parsed, list):
         for obj in parsed:
@@ -259,7 +268,7 @@ class WSConnection:
                     pass  # we're not subscribed anymore anyway
 
 
-    async def run(self) -> None:
+    async def run(self, custom_feature_enabled: bool=False) -> None:
         """
         Main loop: connect → run one connection → on disconnect retry.
         Returns when ``stop()`` has been called.
@@ -296,7 +305,6 @@ class WSConnection:
         attempt = 0
         while not self._stop_requested:
             try:
-                # ---- one connection's lifetime ----
                 self._force_disconnect.clear()
 
                 async with websockets.connect(
@@ -321,7 +329,7 @@ class WSConnection:
                         # custom_feature_enabled controls whether we also
                         # receive new_market, market_resolved, and
                         # best_bid_ask events. We always want these.
-                        "custom_feature_enabled": True,
+                        "custom_feature_enabled": custom_feature_enabled,
                     }
                     await ws.send(msgspec.json.encode(init_msg).decode())
                     await self._emit_event(
