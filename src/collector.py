@@ -21,8 +21,9 @@ Shutdown order matters and is fixed by the nesting below:
     2. exit the writer            closes and seals every active segment
     3. exit the uploader          uploads what is left, then the run logs
 
-Stops when ``duration_sec`` elapses, when ``stop_event`` is set, or (command
-line only) on SIGTERM / SIGINT. A kill that skips Python cleanup (SIGKILL,
+Stops when ``duration_sec`` elapses, when ``stop_event`` is set, when the
+running task is cancelled once (e.g. notebook Interrupt), or (command
+line only) on SIGTERM / SIGINT. All of these return stats. A kill that skips Python cleanup (SIGKILL,
 a hard job timeout) skips steps 2-3, so set ``duration_sec`` below any
 external timeout.
 """
@@ -64,8 +65,9 @@ async def run(
     handle_signals: bool = False,
 ) -> dict:
     """
-    Run the collector until ``duration_sec`` elapses (None = forever) or
-    ``stop_event`` is set, then shut down cleanly. Returns writer and
+    Run the collector until ``duration_sec`` elapses (None = forever),
+    ``stop_event`` is set or the task is cancelled once, then shut down
+    cleanly. A second cancel during shutdown aborts it. Returns writer and
     uploader stats; ``stats["uploader"]["pending"] > 0`` means some sealed
     files did not reach ``landing``.
 
@@ -128,6 +130,15 @@ async def _wait_for_stop(stop: asyncio.Event, duration_sec: float | None) -> Non
         logger.info("collector: stop requested")
     except asyncio.TimeoutError:
         logger.info("collector: duration reached")
+    except asyncio.CancelledError:
+        # Notebook "Interrupt" cancels the cell. Treat the first cancel as a
+        # stop request so run() still shuts down cleanly and returns stats.
+        # uncancel() clears the request; a second cancel during shutdown
+        # still aborts.
+        task = asyncio.current_task()
+        if task is not None:
+            task.uncancel()
+        logger.info("collector: cancelled, shutting down cleanly")
 
 
 async def _upload_run_logs(data_dir: Path, put, source_id: str) -> None:
