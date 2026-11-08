@@ -39,6 +39,8 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from src.common.utilities import Rec
+
 from .connection import (
     ConnectionEvent,
     EventHandler,
@@ -61,8 +63,8 @@ class WSPool:
 
     Use:
 
-        async def on_msg(asset_ids, raw, ts_recv, conn_id):
-            await wal_writer.write(asset_ids, raw, ts_recv)
+        async def on_msg(rec, parsed, conn_id):
+            await wal_writer.write(rec)
 
         pool = WSPool(on_message=on_msg)
         await pool.start()
@@ -281,10 +283,8 @@ class WSPool:
 
     async def _dispatch_message(
         self,
-        asset_ids: tuple[str, ...],
-        raw: str,
+        rec: Rec,
         parsed: "ParsedMessage | None",
-        ts_recv: int,
         conn_id: int,
     ) -> None:
         """
@@ -301,12 +301,8 @@ class WSPool:
 
         The handler can apply its own filter if needed, but the default
         behavior is "forward everything".
-
-        await self._on_message(asset_ids, raw, msg, ts_recv, self._conn_id)
         """
-        await self._on_message_external(
-            asset_ids, raw, parsed, ts_recv, conn_id
-        )
+        await self._on_message_external(rec, parsed, conn_id)
 
 
     async def _dispatch_event(

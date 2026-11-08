@@ -37,9 +37,8 @@ import asyncio
 import logging
 import random
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
 from enum import Enum
-from ..utilities import now_ns
+from src.common.utilities import Rec, now_ns
 import msgspec
 import websockets
 from websockets.asyncio.client import ClientConnection
@@ -86,8 +85,12 @@ class ConnectionEvent(str, Enum):
 # response is a list of book snapshots.
 ParsedMessage = dict | list
 
+# Receives (rec, parsed, conn_id). ``rec`` is the WAL record (ts_recv_ns,
+# asset_ids, raw) built once here and passed by reference down the chain;
+# ``parsed`` is the decoded JSON (None if decode failed) — not persisted,
+# so it stays outside Rec.
 MessageHandler = Callable[
-    [tuple[str, ...], str, ParsedMessage, int, int],
+    [Rec, "ParsedMessage | None", int],
     Awaitable[None],
 ]
 
@@ -469,13 +472,16 @@ class WSConnection:
                 msg = None
 
             # Extract asset_ids for the dispatcher. May be empty (we don't
-            # know how to route) — we still forward, with empty tuple,
+            # know how to route) — we still forward, with empty list,
             # because the WAL wants every byte regardless.
             asset_ids = (
                 asset_ids_from_parsed(msg) if msg is not None else ()
             )
 
-            await self._on_message(asset_ids, raw, msg, ts_recv, self._conn_id)
+            # The one place a Rec is constructed. Everything downstream
+            # (pool -> orchestrator -> WAL / metrics) shares this object.
+            rec = Rec(ts_recv_ns=ts_recv, asset_ids=asset_ids, raw=raw)
+            await self._on_message(rec, msg, self._conn_id)
 
 
 

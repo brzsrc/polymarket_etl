@@ -47,8 +47,8 @@ from pathlib import Path
 from typing import Any
 
 from src.market.gamma_client import GammaClient, GammaError
-from src.utilities import now_ns
-from src.wal.writer import WALWriter
+from src.common.utilities import Rec, now_ns
+from src.wal.writer import Walwriter
 from src.ws.connection import ConnectionEvent
 from src.ws.pool import WSPool
 
@@ -134,18 +134,16 @@ class _Metrics:
 
     def on_message(
         self,
-        asset_ids: tuple[str, ...],
-        raw_str: str,
+        rec: Rec,
         parsed: Any,
-        ts_recv_ns: int,
         conn_id: int,
         callback_ns: int,
     ) -> None:
         self.msgs_total += 1
-        self.bytes_total += len(raw_str)
+        self.bytes_total += len(rec.raw)
         self.callback_ns_total += callback_ns
         self.msgs_per_conn[conn_id] += 1
-        for aid in asset_ids:
+        for aid in rec.asset_ids:
             self.assets_seen.add(aid)
 
         # Latency only meaningful for dict messages with 'timestamp'.
@@ -163,7 +161,7 @@ class _Metrics:
         except (TypeError, ValueError):
             self.missing_timestamp += 1
             return
-        lag_ms = ts_recv_ns / 1e6 - t_server_ms
+        lag_ms = rec.ts_recv_ns / 1e6 - t_server_ms
 
         # Bounded list — drop oldest when we hit the cap.
         if len(self._latencies_ms) >= self._latency_cap:
@@ -241,7 +239,7 @@ class Orchestrator:
     def __init__(
         self,
         out_dir: Path,
-        wal: WALWriter,
+        wal: Walwriter,
         interval_sec: float = DEFAULT_INTERVAL_SEC,
         on_diff: DiffHandler | None = None,
         n_markets: int = TOP_N_MARKETS,
@@ -281,18 +279,16 @@ class Orchestrator:
 
     async def _on_msg(
         self,
-        asset_ids: tuple[str, ...],
-        raw: str,
+        rec: Rec,
         parsed: Any,
-        ts_recv_ns: int,
         conn_id: int,
     ) -> None:
         # Persist first, then update metrics. WAL is the durability path;
         # metrics are best-effort observability.
         t0 = time.perf_counter_ns()
-        await self._wal.write(asset_ids, raw, ts_recv_ns)
+        await self._wal.write(rec)
         cb_ns = time.perf_counter_ns() - t0
-        self._metrics.on_message(asset_ids, raw, parsed, ts_recv_ns, conn_id, cb_ns)
+        self._metrics.on_message(rec, parsed, conn_id, cb_ns)
 
     async def _on_event(
         self,
@@ -493,7 +489,7 @@ async def _main() -> None:
     out_dir = Path("../data/orchestrator")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    async with WALWriter(data_dir=out_dir, shard_prefix_len=1) as wal:
+    async with Walwriter(data_dir=out_dir) as wal:
         orch = Orchestrator(out_dir=out_dir, wal=wal)
         await orch.start()
         try:

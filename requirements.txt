@@ -1,0 +1,4 @@
+# Runtime dependencies of the collector (python -m src.collector / scripts/notebook/run_collector.py).
+msgspec
+websockets>=13   # src/ws/connection.py uses websockets.asyncio.client (added in 13)
+httpx            # src/market/gamma_client.py

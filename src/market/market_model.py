@@ -1,12 +1,12 @@
 """
 Parsed market schema + a single parser that turns raw Gamma dicts into it.
 
-That's it. Anything that touches disk (JSONL writer) lives in `storage.py`.
+That's it. Nothing here touches disk.
 
 The raw response shape from Gamma isn't represented here as its own type —
 we accept it as `dict[str, Any]` and either parse a `Market` out of it or
 return None. The raw dict can still be persisted as-is for forensic value
-by `storage.MarketsJsonlWriter`.
+by `Walwriter.write_market_snapshot` (src/wal/writer.py).
 """
 
 from __future__ import annotations

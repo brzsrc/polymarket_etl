@@ -344,9 +344,9 @@ class GammaClient:
 
         Returns `(parsed_markets, raw_records)` — parallel lists.
 
-        Persistence (writing raw records to markets.jsonl) is the caller's
-        responsibility — wrap with `storage.MarketsJsonlWriter` if you want
-        a history log. Keeping IO out of the client makes it usable from
+        Persistence of the raw records is the caller's responsibility —
+        pass them to `Walwriter.write_market_snapshot` (src/wal/writer.py)
+        if you want a history log. Keeping IO out of the client makes it usable from
         contexts (tests, ad-hoc scripts) that don't want a file on disk.
 
         Raises `GammaError` on mid-pagination failure. Half-baked results
