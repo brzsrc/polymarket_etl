@@ -30,7 +30,7 @@
 
 # COMMAND ----------
 
-dbutils.widgets.text("landing", "/Volumes/polymarket/raw/landing_dev")
+dbutils.widgets.text("landing", "/Volumes/polymarket/raw/landing")
 dbutils.widgets.text("duration_sec", "1800")
 dbutils.widgets.text("n_markets", "50")
 dbutils.widgets.text("segment_max_mb", "50")

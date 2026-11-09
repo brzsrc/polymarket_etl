@@ -96,7 +96,7 @@
 
 dbutils.widgets.text("catalog", "polymarket")
 dbutils.widgets.text("schema", "bronze")
-dbutils.widgets.text("source_path", "/Volumes/polymarket/raw/landing_dev/ws/")
+dbutils.widgets.text("source_path", "/Volumes/polymarket/raw/landing/ws/")
 dbutils.widgets.text("checkpoint_path", "/Volumes/polymarket/raw/checkpoints/bronze_ws_raw/")
 
 CATALOG = dbutils.widgets.get("catalog")
