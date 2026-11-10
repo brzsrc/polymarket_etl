@@ -38,8 +38,8 @@ Markets stream line (see ``Walwriter.write_market_snapshot``)::
 
 Connection events (connected / subscribed / unsubscribed / disconnected /
 reconnecting / watchdog_timeout / closed) go to the events stream of the
-WAL, so downstream can find gaps in the data. Per-second metrics go to
-``{out_dir}/metrics.jsonl`` (observability only, uploaded at exit).
+WAL, so downstream can find gaps in the data. Per-second metrics samples go
+to the metrics stream of the WAL (observability only).
 
 Subscription state lives in memory only: after a restart the first cycle
 starts again from the current top-N.
@@ -48,7 +48,6 @@ starts again from the current top-N.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import statistics
 import time
@@ -238,7 +237,6 @@ class Orchestrator:
 
     def __init__(
         self,
-        out_dir: Path,
         wal: Walwriter,
         interval_sec: float = config.DISCOVERY_INTERVAL_SEC,
         n_markets: int = config.TOP_N_MARKETS,
@@ -258,16 +256,14 @@ class Orchestrator:
         if missing_strikes_to_remove <= 0:
             raise ValueError("missing_strikes_to_remove must be > 0")
 
-        self._out_dir = out_dir
         self._interval_sec = interval_sec
         self._n_markets = n_markets
         self._max_subscribed_markets = max_subscribed_markets
         self._missing_strikes_to_remove = missing_strikes_to_remove
         self._wal = wal
 
-        # Live metrics + their on-disk sinks
+        # Live metrics; sampled into the WAL metrics stream once per second
         self._metrics = _Metrics()
-        self._metrics_fp = None  # opened in start(), closed in stop()
         self._sampler_task: asyncio.Task | None = None
 
         # Pool wiring: bind the bound methods so the pool can call them.
@@ -333,9 +329,6 @@ class Orchestrator:
         if self._task is not None and not self._task.done():
             return
 
-        self._out_dir.mkdir(parents=True, exist_ok=True)
-        self._metrics_fp = (self._out_dir / "metrics.jsonl").open("w")
-
         # Pool MUST be started before we try to add subscriptions; its
         # add_subscriptions() raises RuntimeError if it's not running.
         await self._pool.start()
@@ -362,9 +355,6 @@ class Orchestrator:
         # their run-loops to exit. Without this, conn tasks leak past
         # orchestrator.stop().
         await self._pool.stop()
-        if self._metrics_fp is not None:
-            self._metrics_fp.close()
-            self._metrics_fp = None
 
     # --- internal loops ---
 
@@ -395,13 +385,16 @@ class Orchestrator:
                 break  # stop was set
 
     async def _sampler_loop(self) -> None:
-        """Every METRICS_SAMPLE_INTERVAL_SEC, snapshot metrics → metrics.jsonl."""
+        """Every METRICS_SAMPLE_INTERVAL_SEC, snapshot metrics -> WAL metrics stream."""
         while True:
             await asyncio.sleep(METRICS_SAMPLE_INTERVAL_SEC)
-            snap = self._metrics.snapshot(now_ns())
-            if self._metrics_fp is not None:
-                self._metrics_fp.write(json.dumps(snap) + "\n")
-                self._metrics_fp.flush()
+            ts = now_ns()
+            snap = self._metrics.snapshot(ts)
+            try:
+                await self._wal.write_metrics(ts, snap)
+            except Exception:
+                # Observability only: never let it stop the sampler.
+                logger.exception("write_metrics failed")
             lat = snap["lat_window_ms"]
             logger.info(
                 "metrics t=%5.1fs msgs+%4d/s assets=%d lat n=%d med=%s p95=%s err(d/r/w)=%d/%d/%d",
@@ -567,11 +560,10 @@ async def _main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    out_dir = Path("../data/orchestrator")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    data_dir = Path("../data/orchestrator")
 
-    async with Walwriter(data_dir=out_dir) as wal:
-        orch = Orchestrator(out_dir=out_dir, wal=wal)
+    async with Walwriter(data_dir=data_dir) as wal:
+        orch = Orchestrator(wal=wal)
         await orch.start()
         try:
             # Park until Ctrl-C

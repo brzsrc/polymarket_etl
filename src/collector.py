@@ -27,7 +27,7 @@ Shutdown order matters and is fixed by the nesting below:
 
     1. stop the orchestrator      no new messages
     2. exit the writer            closes and seals every active segment
-    3. exit the uploader          uploads what is left, then the run logs
+    3. exit the uploader          uploads what is left
 
 Stops when ``duration_sec`` elapses, when ``stop_event`` is set, when the
 running task is cancelled once (e.g. notebook Interrupt), or (command
@@ -55,10 +55,6 @@ from src.wal.uploader import PutFn, Uploader, put_file
 from src.wal.writer import Walwriter
 
 logger = logging.getLogger(__name__)
-
-# Orchestrator writes this into data_dir; uploaded under _runs/ on exit.
-# (Connection events go to the WAL's events stream, uploaded continuously.)
-_RUN_LOGS = ("metrics.jsonl",)
 
 ADLS_SCHEME = "abfss://"
 
@@ -136,7 +132,7 @@ async def run(
                 check_interval_sec=config.CHECK_INTERVAL_SEC,
             ) as wal:
                 orch = Orchestrator(
-                    out_dir=data_dir, wal=wal,
+                    wal=wal,
                     n_markets=config.TOP_N_MARKETS,
                     max_subscribed_markets=config.MAX_SUBSCRIBED_MARKETS,
                     interval_sec=config.DISCOVERY_INTERVAL_SEC,
@@ -153,9 +149,8 @@ async def run(
                     await _wait_for_stop(stop, duration_sec)
                 finally:
                     await orch.stop()
-            # Writer has exited: every segment is sealed. The uploader exit
-            # (next) uploads them; run logs go now, best effort.
-            await _upload_run_logs(data_dir, put, up.source_id)
+            # Writer has exited: every segment is sealed; the uploader exit
+            # (next) uploads them.
         result = {"wal": wal.stats(), "uploader": up.stats()}
     finally:
         remove_handlers()
@@ -185,18 +180,6 @@ async def _wait_for_stop(stop: asyncio.Event, duration_sec: float | None) -> Non
         if task is not None:
             task.uncancel()
         logger.info("collector: cancelled, shutting down cleanly")
-
-
-async def _upload_run_logs(data_dir: Path, put, source_id: str) -> None:
-    """Copy the run logs (metrics) to _runs/{source_id}/. Failure is logged, not raised."""
-    for name in _RUN_LOGS:
-        p = data_dir / name
-        if not p.exists():
-            continue
-        try:
-            await asyncio.to_thread(put, p, f"_runs/{source_id}/{name}")
-        except Exception:
-            logger.exception("collector: could not upload run log %s", p)
 
 
 def _install_signal_handlers(stop: asyncio.Event):

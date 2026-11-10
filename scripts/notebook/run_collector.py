@@ -10,7 +10,7 @@
 # MAGIC   wal/{date}/NNNNNN.jsonl.gz   ← 封存好 ──上传──▶  ws/{date}/{source_id}-{date}-NNNNNN.jsonl.gz
 # MAGIC   markets/{date}/...                     ──上传──▶  markets/{date}/...   每轮每个市场一行（含订阅决定）
 # MAGIC   events/{date}/...                      ──上传──▶  events/{date}/...    WS 连接事件（断线、重连）
-# MAGIC   metrics.jsonl                          ──退出时─▶  _runs/{source_id}/
+# MAGIC   metrics/{date}/...                     ──上传──▶  metrics/{date}/...   每秒一条运行指标
 # MAGIC ```
 # MAGIC
 # MAGIC - WAL 必须写在本地盘：`/Volumes` 不支持追加写。
@@ -120,13 +120,14 @@ print(f"source_id      = {up_stats['source_id']}")
 print(f"messages       = {wal_stats['messages']}")
 print(f"market records = {wal_stats['market_records']}")
 print(f"events         = {wal_stats['events']}")
+print(f"metrics        = {wal_stats['metrics']}")
 print(f"sealed         = {wal_stats['sealed']}")
 print(f"uploaded       = {up_stats['uploaded']}  ({up_stats['uploaded_bytes'] / 1e6:.1f} MB)")
 print(f"failures       = {up_stats['failures']}  last_error={up_stats['last_error']}")
 
 # This run's files at the destination
 sid = up_stats["source_id"]
-for stream in ("ws", "markets", "events"):
+for stream in ("ws", "markets", "events", "metrics"):
     files = sorted(Path(LANDING, stream).glob(f"*/{sid}-*.jsonl.gz"))
     print(f"{stream}: {len(files)} files")
     for f in files[-5:]:

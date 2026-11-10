@@ -1,13 +1,14 @@
 """
-Append-only WAL writer for raw WebSocket messages, Gamma snapshots and
-connection events (segment layout).
+Append-only WAL writer for raw WebSocket messages, Gamma snapshots,
+connection events and metrics samples (segment layout).
 
-Three streams, same layout and same lifecycle, under ``data_dir``::
+Four streams, same layout and same lifecycle, under ``data_dir``::
 
     wal/{YYYY-MM-DD}/000000.jsonl.gz       WS messages, sealed (immutable, gzip)
     wal/{YYYY-MM-DD}/000001.jsonl          WS messages, active
     markets/{YYYY-MM-DD}/000000.jsonl.gz   one line per market per discovery cycle
     events/{YYYY-MM-DD}/000000.jsonl.gz    WS connection events (connect / disconnect / ...)
+    metrics/{YYYY-MM-DD}/000000.jsonl.gz   orchestrator metrics, one sample per second
 
 Each (stream, date) has at most one active segment. The date is the UTC
 date of ``ts_recv_ns``. Every WS message is written once, with its full
@@ -84,7 +85,8 @@ _COPY_CHUNK = 1 << 20
 WAL = "wal"
 MARKETS = "markets"
 EVENTS = "events"
-_STREAMS = (WAL, MARKETS, EVENTS)
+METRICS = "metrics"
+_STREAMS = (WAL, MARKETS, EVENTS, METRICS)
 
 # (stream, date), e.g. ("wal", "2026-11-08")
 _Key = tuple[str, str]
@@ -107,6 +109,7 @@ class Walwriter:
         write(rec)                     record one WS message
         write_market_snapshot(ts, recs) record one Gamma discovery cycle
         write_event(ts, event)         record one WS connection event
+        write_metrics(ts, sample)      record one metrics sample
         flush()                        fsync all dirty files now
         stats()                        counters for monitoring
         check_now() / wait_seals()     run one maintenance pass / wait for seals (tests)
@@ -167,6 +170,7 @@ class Walwriter:
         self._n_market_bytes = 0
         self._n_events = 0
         self._n_event_bytes = 0
+        self._n_metrics = 0
         self._n_sealed = 0
         self._n_sealed_bytes = 0      # compressed bytes produced
         self._n_torn_bytes = 0        # torn trailing bytes dropped while sealing
@@ -228,9 +232,9 @@ class Walwriter:
 
         logger.info(
             "WAL writer stopped (msgs=%d, bytes=%d, no_route=%d, sealed=%d, "
-            "market_records=%d, market_bytes=%d, events=%d)",
+            "market_records=%d, market_bytes=%d, events=%d, metrics=%d)",
             self._n_messages, self._n_bytes, self._n_no_route, self._n_sealed,
-            self._n_market_records, self._n_market_bytes, self._n_events,
+            self._n_market_records, self._n_market_bytes, self._n_events, self._n_metrics,
         )
 
     # ------------------------------------------------------------------
@@ -307,6 +311,19 @@ class Walwriter:
             self._append_locked((EVENTS, date_str), line)
             self._n_events += 1
             self._n_event_bytes += len(line)
+
+    async def write_metrics(self, ts_ns: int, sample: dict) -> None:
+        """
+        Persist one metrics sample to ``{data_dir}/metrics/{date}/NNNNNN.jsonl``.
+
+        Each line is ``{"ts_ns": <int>, **sample}``; the orchestrator writes
+        one sample per second. Observability only, not on the hot path.
+        """
+        date_str = self._date_str_from_ns(ts_ns)
+        line = self._encoder.encode({"ts_ns": ts_ns, **sample}) + b"\n"
+        async with self._lock:
+            self._append_locked((METRICS, date_str), line)
+            self._n_metrics += 1
 
     async def flush(self) -> None:
         """fsync every dirty file now."""
@@ -524,6 +541,7 @@ class Walwriter:
             "market_bytes": self._n_market_bytes,
             "events": self._n_events,
             "event_bytes": self._n_event_bytes,
+            "metrics": self._n_metrics,
             "sealed": self._n_sealed,
             "sealed_bytes": self._n_sealed_bytes,
             "torn_bytes": self._n_torn_bytes,

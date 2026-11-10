@@ -80,12 +80,20 @@ class FakeWal:
     def __init__(self):
         self.snapshots: list[tuple[int, list[dict]]] = []
         self.events: list[tuple[int, dict]] = []
+        self.metrics: list[tuple[int, dict]] = []
+        self.fail_metrics = 0          # fail the next N write_metrics calls
 
     async def write_market_snapshot(self, ts, records):
         self.snapshots.append((ts, records))
 
     async def write_event(self, ts, event):
         self.events.append((ts, event))
+
+    async def write_metrics(self, ts, sample):
+        if self.fail_metrics:
+            self.fail_metrics -= 1
+            raise OSError("disk full")
+        self.metrics.append((ts, sample))
 
     def last_records(self) -> dict[str, dict]:
         return {r["market_id"]: r for r in self.snapshots[-1][1]}
@@ -105,7 +113,7 @@ def gamma(monkeypatch):
 
 def make_orch(tmp_path: Path, **kw) -> tuple[Orchestrator, FakePool, FakeWal]:
     wal = FakeWal()
-    orch = Orchestrator(out_dir=tmp_path, wal=wal, **kw)
+    orch = Orchestrator(wal=wal, **kw)
     pool = FakePool()
     orch._pool = pool
     return orch, pool, wal
@@ -123,14 +131,14 @@ def tokens(*mids: str) -> set[str]:
 
 def test_n_markets_must_fit_under_cap(tmp_path):
     with pytest.raises(ValueError, match="max_subscribed_markets"):
-        Orchestrator(out_dir=tmp_path, wal=FakeWal(), n_markets=11, max_subscribed_markets=10)
-    Orchestrator(out_dir=tmp_path, wal=FakeWal(), n_markets=10, max_subscribed_markets=10)
+        Orchestrator(wal=FakeWal(), n_markets=11, max_subscribed_markets=10)
+    Orchestrator(wal=FakeWal(), n_markets=10, max_subscribed_markets=10)
 
 
 def test_default_limits_are_consistent():
     assert config.TOP_N_MARKETS <= config.MAX_SUBSCRIBED_MARKETS == 1000
     # the defaults actually used by Orchestrator() must pass its own check
-    Orchestrator(out_dir=Path("."), wal=FakeWal())
+    Orchestrator(wal=FakeWal())
 
 
 # --- subscription rules --------------------------------------------------------
@@ -304,3 +312,22 @@ def test_connection_events_go_to_wal(tmp_path):
     (ts, event), = wal.events
     assert ts > 0
     assert event == {"conn_id": 3, "event": "connected", "extra": extra}
+
+
+def test_sampler_writes_metrics_to_wal_and_survives_errors(tmp_path, monkeypatch):
+    monkeypatch.setattr(orchestrator, "METRICS_SAMPLE_INTERVAL_SEC", 0.01)
+    orch, _, wal = make_orch(tmp_path)
+    wal.fail_metrics = 2               # first two writes fail; the sampler must keep going
+
+    async def go():
+        task = asyncio.create_task(orch._sampler_loop())
+        await asyncio.sleep(0.15)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(go())
+    assert len(wal.metrics) >= 3
+    ts, sample = wal.metrics[-1]
+    assert ts > 0 and "msgs_total" in sample and "errors" in sample
+    assert [t for t, _ in wal.metrics] == sorted(t for t, _ in wal.metrics)

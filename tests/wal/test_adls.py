@@ -241,6 +241,7 @@ def test_uploader_with_adls_put_lands_every_segment(tmp_path):
                     await asyncio.sleep(0.002)
                 await w.write_market_snapshot(t0, [{"market_id": "m1", "raw": {"id": "m1"}}])
                 await w.write_event(t0, {"conn_id": 0, "event": "connected", "extra": {}})
+                await w.write_metrics(t0, {"msgs_total": 20})
         return up.stats()
 
     st = asyncio.run(go())
@@ -249,6 +250,7 @@ def test_uploader_with_adls_put_lands_every_segment(tmp_path):
     assert len(ws) > 1 and got == list(range(20))                # rotated, nothing lost, in order
     assert any(p.startswith("polymarket/markets/2025-11-08/h-") for p in fs.files)
     assert any(p.startswith("polymarket/events/2025-11-08/h-") for p in fs.files)
+    assert any(p.startswith("polymarket/metrics/2025-11-08/h-") for p in fs.files)
     assert not any("/_staging/" in p for p in fs.files)
     assert st["pending"] == 0 and st["failures"] == 0
 

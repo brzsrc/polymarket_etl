@@ -17,21 +17,21 @@ from src.common.utilities import Rec, now_ns
 
 
 class FakeOrchestrator:
-    """Writes WS messages and a market snapshot through the real writer."""
+    """Writes WS messages, a market snapshot, an event and a metrics sample through the real writer."""
 
     instances: list["FakeOrchestrator"] = []
 
-    def __init__(self, out_dir, wal, **kwargs):
-        self.out_dir, self.wal, self.kwargs = out_dir, wal, kwargs
+    def __init__(self, wal, **kwargs):
+        self.wal, self.kwargs = wal, kwargs
         self.task = None
         self.stopped = False
         self.n_written = 0
         FakeOrchestrator.instances.append(self)
 
     async def start(self):
-        (self.out_dir / "metrics.jsonl").write_text('{"m":1}\n')
         await self.wal.write_market_snapshot(now_ns(), [{"market_id": "m1", "raw": {"id": "m1"}}])
         await self.wal.write_event(now_ns(), {"conn_id": 0, "event": "connected", "extra": {}})
+        await self.wal.write_metrics(now_ns(), {"msgs_total": 0})
         self.task = asyncio.create_task(self._produce())
 
     async def _produce(self):
@@ -88,10 +88,12 @@ def test_run_lands_everything_and_cleans_up(tmp_path, fast_config, monkeypatch):
     assert len(list((landing / "ws").rglob("*.gz"))) > 1          # rotated mid-run
     assert len(list((landing / "markets").rglob("*.gz"))) == 1
     assert len(list((landing / "events").rglob("*.gz"))) == 1     # events go through the WAL
-    # run logs (metrics only) uploaded under _runs/{source_id}/
-    sid = stats["uploader"]["source_id"]
-    assert (landing / "_runs" / sid / "metrics.jsonl").read_text() == '{"m":1}\n'
-    assert not (landing / "_runs" / sid / "events.jsonl").exists()
+    # metrics go through the WAL too; no separate run-log upload any more
+    metrics = list((landing / "metrics").rglob("*.gz"))
+    assert len(metrics) == 1
+    assert json.loads(gzip.open(metrics[0]).read())["msgs_total"] == 0
+    assert stats["wal"]["metrics"] == 1
+    assert not (landing / "_runs").exists()
     # nothing left behind
     assert stats["uploader"]["pending"] == 0
     assert not list(data.glob("*/*/*.jsonl")) and not list(data.glob("*/*/*.jsonl.gz"))
@@ -233,7 +235,8 @@ def test_run_uploads_to_adls(tmp_path, fast_config, monkeypatch):
     assert len(got) == stats["wal"]["messages"] > 0
     assert any(p.startswith("polymarket/markets/") for p in fs.files)
     assert any(p.startswith("polymarket/events/") for p in fs.files)
-    assert fs.files[f"polymarket/_runs/{sid}/metrics.jsonl"] == b'{"m":1}\n'
+    assert any(p.startswith("polymarket/metrics/") and f"/{sid}-" in p for p in fs.files)
+    assert not any("/_runs/" in p for p in fs.files)
     assert not any("/_staging/" in p for p in fs.files)
     assert stats["uploader"]["pending"] == 0
     assert closed == [True]                                     # HTTP client closed on exit

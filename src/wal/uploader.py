@@ -6,6 +6,7 @@ Local side (written by ``Walwriter``)::
     {data_dir}/wal/{date}/000003.jsonl.gz        sealed, waiting for upload
     {data_dir}/markets/{date}/000001.jsonl.gz
     {data_dir}/events/{date}/000000.jsonl.gz
+    {data_dir}/metrics/{date}/000000.jsonl.gz
     {data_dir}/wal/{date}/000002.jsonl.gz.uploaded   marker left after upload
 
 Destination (``dest_root``)::
@@ -13,6 +14,7 @@ Destination (``dest_root``)::
     ws/{date}/{source_id}-{date}-000003.jsonl.gz
     markets/{date}/{source_id}-{date}-000001.jsonl.gz
     events/{date}/{source_id}-{date}-000000.jsonl.gz
+    metrics/{date}/{source_id}-{date}-000000.jsonl.gz
     _staging/                                     in-flight copies, normally empty
 
 ``dest_root`` is a UC volume path (``/Volumes/...``, only on Databricks
@@ -63,7 +65,7 @@ PutFn = Callable[[Path, str], None]
 _SEALED_RE = re.compile(r"^(\d{6})\.jsonl\.gz$")
 _MARKER = ".uploaded"
 # local stream dir -> destination dir
-_REMOTE_STREAM = {"wal": "ws", "markets": "markets", "events": "events"}
+_REMOTE_STREAM = {"wal": "ws", "markets": "markets", "events": "events", "metrics": "metrics"}
 
 
 # ----------------------------------------------------------------------
@@ -120,7 +122,7 @@ def put_file(local: Path, rel: str, *, dest_root: Path) -> None:
 
 class Uploader:
     """
-    Upload sealed ``{wal,markets,events}/{date}/NNNNNN.jsonl.gz`` files with ``put``.
+    Upload sealed ``{wal,markets,events,metrics}/{date}/NNNNNN.jsonl.gz`` files with ``put``.
 
     - Only complete ``.jsonl.gz`` files are picked up. The writer creates them
       by rename, so they are never partial; ``.jsonl`` and ``.tmp`` are ignored.

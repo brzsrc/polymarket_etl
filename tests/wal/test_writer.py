@@ -218,6 +218,39 @@ def test_events_written_to_own_stream(tmp_path):
     assert st["events"] == 2 and st["messages"] == 1
 
 
+def test_metrics_written_to_own_stream(tmp_path):
+    async def go():
+        async with Walwriter(tmp_path, segment_max_bytes=None) as w:
+            await w.write(rec(0))
+            await w.write_metrics(T0 + 1, {"msgs_total": 1, "errors": {"disconnects": 0}})
+            await w.write_metrics(T0 + 2, {"msgs_total": 5, "errors": {"disconnects": 1}})
+            return w.stats()
+
+    st = run(go())
+    assert names(tmp_path / "metrics" / DATE) == ["000000.jsonl.gz"]   # sealed on exit like the others
+    lines = [json.loads(l) for l in gz_lines(tmp_path / "metrics" / DATE / "000000.jsonl.gz")]
+    assert [(l["ts_ns"], l["msgs_total"]) for l in lines] == [(T0 + 1, 1), (T0 + 2, 5)]
+    assert lines[1]["errors"] == {"disconnects": 1}
+    assert st["metrics"] == 2 and st["messages"] == 1
+
+
+def test_metrics_leftover_from_crash_sealed_on_start(tmp_path):
+    # A crash leaves the active metrics segment as .jsonl; the next start seals it
+    # (this used to be a metrics.jsonl that the restart truncated).
+    d = tmp_path / "metrics" / DATE
+    d.mkdir(parents=True)
+    (d / "000000.jsonl").write_bytes(b'{"ts_ns":1,"msgs_total":7}\n{"ts_ns":2,"msg')   # torn tail
+
+    async def go():
+        async with Walwriter(tmp_path, segment_max_bytes=None) as w:
+            await w.wait_seals()
+            await w.write_metrics(T0, {"msgs_total": 0})
+
+    run(go())
+    assert names(d) == ["000000.jsonl.gz", "000001.jsonl.gz"]       # old kept, new number
+    assert [json.loads(l)["msgs_total"] for l in gz_lines(d / "000000.jsonl.gz")] == [7]
+
+
 def test_markets_rotate_and_seal_like_wal(tmp_path):
     async def go():
         async with Walwriter(tmp_path, seal_on_exit=False, segment_max_bytes=100) as w:

@@ -279,6 +279,7 @@ def test_with_writer_every_segment_reaches_destination(tmp_path):
                     await asyncio.sleep(0.002)
                 await w.write_market_snapshot(T0, [{"market_id": "m1", "raw": {"id": "m1"}}])
                 await w.write_event(T0, {"conn_id": 0, "event": "connected", "extra": {}})
+                await w.write_metrics(T0, {"msgs_total": 20})
             # writer exited: its last segments were sealed on exit
         return up.stats()
 
@@ -289,6 +290,7 @@ def test_with_writer_every_segment_reaches_destination(tmp_path):
     assert got == list(range(20))                       # nothing lost, in order, incl. the exit seal
     assert len(list((dest / "markets" / DATE).glob("*.gz"))) == 1
     assert len(list((dest / "events" / DATE).glob("dbx-*.jsonl.gz"))) == 1
+    assert len(list((dest / "metrics" / DATE).glob("dbx-*.jsonl.gz"))) == 1
     assert st["pending"] == 0
     assert not list(data.glob("*/*/*.jsonl")) and not list(data.glob("*/*/*.jsonl.gz"))
     assert list((dest / "_staging").iterdir()) == []
