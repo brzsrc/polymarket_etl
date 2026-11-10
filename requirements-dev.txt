@@ -3,3 +3,4 @@
 -r requirements.txt
 numpy    # src/replay_engine/book.py (tests/replay_engine)
 pytest
+pytest-timeout    # CI: fail a hanging test with a traceback instead of hanging the job

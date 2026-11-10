@@ -38,6 +38,9 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10           # the suite takes seconds; never hang for hours
+    env:
+      PYTHONUNBUFFERED: "1"       # show test output as it happens
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -46,12 +49,16 @@ jobs:
           cache: pip
           cache-dependency-path: requirements*.txt
       - run: pip install -r requirements-dev.txt
-      - run: python -m pytest -q
+      # -v: one line per test, so the log shows which test is running.
+      # faulthandler_timeout: dump every thread's stack if a test runs > 60 s.
+      # --timeout: then fail that test (pytest-timeout) and go on with the rest.
+      - run: python -m pytest -v --durations=10 -o faulthandler_timeout=60 --timeout=90
 
   image:
     needs: test
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
