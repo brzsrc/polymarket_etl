@@ -1,83 +1,82 @@
 """
 Periodic market-discovery loop (Task 1.4).
 
-Runs a Gamma cycle every N minutes, diffs the result against the pool's
-current subscription set, and applies the additions/removals.
+Every ``interval_sec`` (default 10 min) one discovery cycle:
 
-Design notes:
+1. Ask Gamma for the top ``n_markets`` open markets by 24h volume.
+2. For subscribed markets that are NOT in this top-N, look up their current
+   status by id (``GammaClient.markets_by_ids``).
+3. Apply the subscription rules below, subscribe / unsubscribe the tokens
+   on the WS pool.
+4. Write one line per market (top-N + everything still subscribed) to the
+   markets stream of the WAL, with the decision taken for it.
 
-- The loop is the *backup* path for new markets. The primary path is the
-  WS ``new_market`` event (sub-second latency once active subscriptions
-  exist on the relevant connection). The Gamma poll catches anything WS
-  missed (e.g. during a reconnect).
+Subscription rules (goal: once a market is recorded, record it until it
+ends, so order books in the WAL are continuous):
 
-- ``to_remove`` uses a "strike" mechanism (3 consecutive cycles missing
-  before actually removing). This protects against offset-pagination
-  edge cases where a single page can shift records between cycles, briefly
-  hiding an asset. Without strikes, we'd flap subscriptions for assets that
-  are still active.
+- In top-N, not subscribed yet          -> subscribe (``added``)
+- Dropped out of top-N, still trading    -> keep (``kept``)
+- Dropped out of top-N, ended            -> unsubscribe (``removed``/``ended``);
+  ended = ``closed`` or not ``acceptingOrders``. ``endDate`` is NOT used:
+  for sports markets it is the kick-off time, the market trades long after.
+- Dropped out of top-N, not returned by Gamma -> one strike; unsubscribe
+  after ``missing_strikes_to_remove`` consecutive cycles (``not_found``).
+- More than ``max_subscribed_markets``    -> unsubscribe the lowest-volume
+  markets that are not in this top-N (``cap``). A top-N market is never
+  evicted, hence ``n_markets <= max_subscribed_markets``.
+- Status lookup fails                    -> add as usual, remove nothing
+  (not even for the cap; it is enforced on the next successful cycle).
+- Top-N fetch fails                      -> change nothing this cycle.
 
-- Each cycle persists the full set of seen markets via
-  ``WALWriter.write_market_snapshot``, giving us the metadata history
-  (question text, endDate, volume, etc.) over time, alongside the WAL.
+Markets stream line (see ``Walwriter.write_market_snapshot``)::
 
-- Failure of one cycle is non-fatal — it just delays discovery by one
-  interval. We log and move on.
+    {"ts_recv_ns": ..., "market_id": "6236747", "source": "top" | "lookup",
+     "rank": 3 | null, "raw": {...Gamma dict...} | null,
+     "sub": {"action": "added" | "kept" | "removed",
+             "reason": null | "ended" | "cap" | "not_found" | "lookup_failed",
+             "missing_strikes": 0}}
 
-- A lightweight Metrics collector runs alongside, fed by the same
-  on_message / on_event callbacks the Pool uses. Each second we snapshot
-  rolling counters into ``{out_dir}/metrics.jsonl`` and every connection
-  event into ``{out_dir}/events.jsonl``. This is the long-running, single-
-  pool flavor of orchestra_benchmark's metrics — no warmup window, no
-  setup-comparison, just live observability.
+Connection events (connected / subscribed / unsubscribed / disconnected /
+reconnecting / watchdog_timeout / closed) go to the events stream of the
+WAL, so downstream can find gaps in the data. Per-second metrics samples go
+to the metrics stream of the WAL (observability only).
+
+Subscription state lives in memory only: after a restart the first cycle
+starts again from the current top-N.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import statistics
 import time
 from collections import defaultdict
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from src.market.gamma_client import GammaClient, GammaError
-from src.utilities import now_ns
-from src.wal.writer import WALWriter
+from src import config
+from src.market.gamma_client import GammaClient, GammaError, MarketInfo
+from src.common.utilities import Rec, now_ns
+from src.wal.writer import Walwriter
 from src.ws.connection import ConnectionEvent
 from src.ws.pool import WSPool
 
 logger = logging.getLogger(__name__)
 
 
-# Default cycle interval. Spec said "every 5-10 minutes" — we go with 10
-# because the WS path covers the urgent cases (new_market arrives in seconds)
-# and 10 min keeps Gamma load reasonable. Researchers can change at config.
-DEFAULT_INTERVAL_SEC = 600.0
-TOP_N_MARKETS = 3000
 METRICS_SAMPLE_INTERVAL_SEC = 1.0
 
 
-# Optional callback the application can supply to react to each cycle's
-# diff (e.g. for metrics or audit logging).
-DiffHandler = Callable[["DiscoveryDiff"], Awaitable[None]]
-
-
 @dataclass
-class DiscoveryDiff:
-    """What changed in one discovery cycle."""
-    cycle_started_at: datetime
-    cycle_finished_at: datetime
-
-    """Token IDs we just subscribed to (refcount went from 0 to 1)."""
-    added: set[str]
-    """Token IDs we just unsubscribed from (3-strike mechanism triggered)."""
-    removed: set[str]
+class _SubscribedMarket:
+    """One subscribed market, tracked across discovery cycles."""
+    info: MarketInfo                   # latest known Gamma data (tokens, volume24hr, raw)
+    first_subscribed_ns: int
+    last_in_top_ns: int                # last cycle it was in the top-N
+    missing_strikes: int = 0           # consecutive cycles the by-id lookup didn't return it
 
 
 # =============================================================================
@@ -134,18 +133,16 @@ class _Metrics:
 
     def on_message(
         self,
-        asset_ids: tuple[str, ...],
-        raw_str: str,
+        rec: Rec,
         parsed: Any,
-        ts_recv_ns: int,
         conn_id: int,
         callback_ns: int,
     ) -> None:
         self.msgs_total += 1
-        self.bytes_total += len(raw_str)
+        self.bytes_total += len(rec.raw)
         self.callback_ns_total += callback_ns
         self.msgs_per_conn[conn_id] += 1
-        for aid in asset_ids:
+        for aid in rec.asset_ids:
             self.assets_seen.add(aid)
 
         # Latency only meaningful for dict messages with 'timestamp'.
@@ -163,7 +160,7 @@ class _Metrics:
         except (TypeError, ValueError):
             self.missing_timestamp += 1
             return
-        lag_ms = ts_recv_ns / 1e6 - t_server_ms
+        lag_ms = rec.ts_recv_ns / 1e6 - t_server_ms
 
         # Bounded list — drop oldest when we hit the cap.
         if len(self._latencies_ms) >= self._latency_cap:
@@ -240,25 +237,33 @@ class Orchestrator:
 
     def __init__(
         self,
-        out_dir: Path,
-        wal: WALWriter,
-        interval_sec: float = DEFAULT_INTERVAL_SEC,
-        on_diff: DiffHandler | None = None,
-        n_markets: int = TOP_N_MARKETS,
+        wal: Walwriter,
+        interval_sec: float = config.DISCOVERY_INTERVAL_SEC,
+        n_markets: int = config.TOP_N_MARKETS,
+        max_subscribed_markets: int = config.MAX_SUBSCRIBED_MARKETS,
+        missing_strikes_to_remove: int = config.MISSING_STRIKES_TO_REMOVE,
     ) -> None:
         if interval_sec <= 0:
             raise ValueError("interval_sec must be > 0")
+        if n_markets <= 0:
+            raise ValueError("n_markets must be > 0")
+        if n_markets > max_subscribed_markets:
+            # Top-N markets are never evicted, so the cap must hold all of them.
+            raise ValueError(
+                f"n_markets ({n_markets}) must be <= max_subscribed_markets "
+                f"({max_subscribed_markets})"
+            )
+        if missing_strikes_to_remove <= 0:
+            raise ValueError("missing_strikes_to_remove must be > 0")
 
-        self._out_dir = out_dir
         self._interval_sec = interval_sec
         self._n_markets = n_markets
-        self._on_diff = on_diff
+        self._max_subscribed_markets = max_subscribed_markets
+        self._missing_strikes_to_remove = missing_strikes_to_remove
         self._wal = wal
 
-        # Live metrics + their on-disk sinks
+        # Live metrics; sampled into the WAL metrics stream once per second
         self._metrics = _Metrics()
-        self._metrics_fp = None  # opened in start(), closed in stop()
-        self._events_fp = None
         self._sampler_task: asyncio.Task | None = None
 
         # Pool wiring: bind the bound methods so the pool can call them.
@@ -269,10 +274,9 @@ class Orchestrator:
             on_event=self._on_event,
         )
 
-        # Source of truth for "what we currently have subscribed". Mirrors
-        # the pool's view but kept here so we don't have to query the pool
-        # during diff (no lock contention and we own the schedule).
-        self._current_subscriptions: set[str] = set()
+        # Source of truth for "what we currently have subscribed", per market
+        # (market id -> state). The pool only knows tokens; rules need markets.
+        self._subs: dict[str, _SubscribedMarket] = {}
 
         self._task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
@@ -281,18 +285,16 @@ class Orchestrator:
 
     async def _on_msg(
         self,
-        asset_ids: tuple[str, ...],
-        raw: str,
+        rec: Rec,
         parsed: Any,
-        ts_recv_ns: int,
         conn_id: int,
     ) -> None:
         # Persist first, then update metrics. WAL is the durability path;
         # metrics are best-effort observability.
         t0 = time.perf_counter_ns()
-        await self._wal.write(asset_ids, raw, ts_recv_ns)
+        await self._wal.write(rec)
         cb_ns = time.perf_counter_ns() - t0
-        self._metrics.on_message(asset_ids, raw, parsed, ts_recv_ns, conn_id, cb_ns)
+        self._metrics.on_message(rec, parsed, conn_id, cb_ns)
 
     async def _on_event(
         self,
@@ -301,21 +303,24 @@ class Orchestrator:
         extra: dict,
     ) -> None:
         self._metrics.on_event(conn_id, event, extra)
-        if self._events_fp is not None:
-            self._events_fp.write(json.dumps({
-                "ts_ns": now_ns(),
-                "conn_id": conn_id,
-                "event": event.value,
-                "extra": extra,
-            }) + "\n")
-            self._events_fp.flush()
+        try:
+            await self._wal.write_event(
+                now_ns(), {"conn_id": conn_id, "event": event.value, "extra": extra}
+            )
+        except Exception:
+            logger.exception("write_event failed (%s, conn %d)", event.value, conn_id)
 
     # --- public API (unchanged shape) ---
 
     @property
     def current_subscriptions(self) -> frozenset[str]:
         """Read-only snapshot of the asset_ids we believe are subscribed."""
-        return frozenset(self._current_subscriptions)
+        return frozenset(t for sub in self._subs.values() for t in sub.info.tokens)
+
+    @property
+    def subscribed_markets(self) -> frozenset[str]:
+        """Read-only snapshot of the market ids we have subscribed."""
+        return frozenset(self._subs)
 
     async def start(self) -> None:
         """Begin the loop. Returns immediately; first cycle runs in the
@@ -323,10 +328,6 @@ class Orchestrator:
         ``run_one_cycle()`` which is the building block we expose for tests."""
         if self._task is not None and not self._task.done():
             return
-
-        self._out_dir.mkdir(parents=True, exist_ok=True)
-        self._metrics_fp = (self._out_dir / "metrics.jsonl").open("w")
-        self._events_fp = (self._out_dir / "events.jsonl").open("w")
 
         # Pool MUST be started before we try to add subscriptions; its
         # add_subscriptions() raises RuntimeError if it's not running.
@@ -354,11 +355,6 @@ class Orchestrator:
         # their run-loops to exit. Without this, conn tasks leak past
         # orchestrator.stop().
         await self._pool.stop()
-        for fp_attr in ("_metrics_fp", "_events_fp"):
-            fp = getattr(self, fp_attr)
-            if fp is not None:
-                fp.close()
-                setattr(self, fp_attr, None)
 
     # --- internal loops ---
 
@@ -389,13 +385,16 @@ class Orchestrator:
                 break  # stop was set
 
     async def _sampler_loop(self) -> None:
-        """Every METRICS_SAMPLE_INTERVAL_SEC, snapshot metrics → metrics.jsonl."""
+        """Every METRICS_SAMPLE_INTERVAL_SEC, snapshot metrics -> WAL metrics stream."""
         while True:
             await asyncio.sleep(METRICS_SAMPLE_INTERVAL_SEC)
-            snap = self._metrics.snapshot(now_ns())
-            if self._metrics_fp is not None:
-                self._metrics_fp.write(json.dumps(snap) + "\n")
-                self._metrics_fp.flush()
+            ts = now_ns()
+            snap = self._metrics.snapshot(ts)
+            try:
+                await self._wal.write_metrics(ts, snap)
+            except Exception:
+                # Observability only: never let it stop the sampler.
+                logger.exception("write_metrics failed")
             lat = snap["lat_window_ms"]
             logger.info(
                 "metrics t=%5.1fs msgs+%4d/s assets=%d lat n=%d med=%s p95=%s err(d/r/w)=%d/%d/%d",
@@ -407,78 +406,149 @@ class Orchestrator:
                 snap["errors"]["watchdog"],
             )
 
-    async def run_one_cycle(self) -> DiscoveryDiff | None:
+    async def run_one_cycle(self) -> bool:
         """
-        Run a single discovery cycle and apply diff to the pool.
+        Run a single discovery cycle and apply it to the pool (rules: see the
+        module docstring). What was decided for each market is written to
+        the markets stream of the WAL.
 
-        Returns the ``DiscoveryDiff`` on success, or ``None`` if the Gamma
-        fetch failed (in which case nothing was changed). Never raises on
-        Gamma errors — those are logged and swallowed; the next cycle will
-        retry.
+        Returns True if the cycle was applied, False if the top-N fetch
+        failed (then nothing changed). Gamma errors are logged, never raised;
+        the next cycle retries.
         """
         cycle_started_at = datetime.now(timezone.utc)
         try:
             async with GammaClient() as client:
-                market_ids, asset_ids, raws = await client.fetch_top_n_by_volume24h(
-                    n=self._n_markets
-                )
+                top_list = await client.top_markets_by_volume24h(n=self._n_markets)
+                top = {m.id: m for m in top_list}   # keeps rank order
+                dropped = [mid for mid in self._subs if mid not in top]
+                looked_up: dict[str, MarketInfo] = {}
+                lookup_ok = True
+                if dropped:
+                    try:
+                        looked_up = await client.markets_by_ids(dropped)
+                    except GammaError as e:
+                        # Can't tell ended from still trading: remove nothing.
+                        logger.warning("status lookup failed, removing nothing this cycle: %s", e)
+                        lookup_ok = False
         except GammaError as e:
-            # Mid-pagination failure — half-baked data is worse than no
-            # data because it would trigger spurious to_remove. Skip cycle.
+            # Half-baked top-N would look like markets dropping out. Skip cycle.
             logger.warning("discovery cycle aborted (Gamma error): %s", e)
-            return None
+            return False
 
-        # Persist the full raw market list for this cycle. Goes to the
-        # markets stream of the WAL, NOT the per-asset shards — see
-        # WALWriter.write_market_snapshot.
         cycle_ts_ns = now_ns()
+        added_mkts, removed_mkts, records = self._apply_rules(
+            top, dropped, looked_up, lookup_ok, cycle_ts_ns
+        )
+
+        # Persist what Gamma said and what we decided, before touching the pool.
         try:
-            await self._wal.write_market_snapshot(cycle_ts_ns, raws)
+            await self._wal.write_market_snapshot(cycle_ts_ns, records)
         except Exception:
-            # Persistence failure shouldn't kill the cycle — diff/apply
-            # is the more important task.
+            # Persistence failure shouldn't kill the cycle.
             logger.exception("write_market_snapshot failed")
 
-        seen = set(asset_ids)
+        added_tokens = [t for mid in added_mkts for t in self._subs[mid].info.tokens]
+        removed_tokens = [t for sub, _reason in removed_mkts.values() for t in sub.info.tokens]
+        if added_tokens:
+            await self._pool.add_subscriptions(added_tokens)
+        if removed_tokens:
+            await self._pool.remove_subscriptions(removed_tokens)
 
-        # Compute diff
-        added = seen - self._current_subscriptions
-        remove = self._current_subscriptions - seen
-
-        if added:
-            await self._pool.add_subscriptions(list(added))
-        if remove:
-            await self._pool.remove_subscriptions(list(remove))
-
-        # Update our local view
-        self._current_subscriptions.update(added)
-        self._current_subscriptions.difference_update(remove)
-
-        cycle_finished_at = datetime.now(timezone.utc)
-        diff = DiscoveryDiff(
-            cycle_started_at=cycle_started_at,
-            cycle_finished_at=cycle_finished_at,
-            added=added,
-            removed=remove,
-        )
-
+        reasons = _count(reason for _sub, reason in removed_mkts.values())
         logger.info(
-            "discovery diff: +%d added, -%d removed, "
-            "%d total subs, took %.1fs (raws=%d persisted)",
-            len(added),
-            len(remove),
-            len(self._current_subscriptions),
-            (cycle_finished_at - cycle_started_at).total_seconds(),
-            len(raws),
+            "discovery: top=%d, +%d markets, -%d markets%s, kept outside top=%d, "
+            "subscribed %d markets / %d tokens, lookup_ok=%s, took %.1fs",
+            len(top), len(added_mkts), len(removed_mkts),
+            f" {dict(reasons)}" if reasons else "",
+            sum(1 for mid in self._subs if mid not in top), len(self._subs),
+            sum(len(sub.info.tokens) for sub in self._subs.values()),
+            lookup_ok, (datetime.now(timezone.utc) - cycle_started_at).total_seconds(),
         )
+        return True
 
-        if self._on_diff is not None:
-            try:
-                await self._on_diff(diff)
-            except Exception:
-                logger.exception("on_diff handler raised")
+    def _apply_rules(
+        self,
+        top: dict[str, MarketInfo],
+        dropped: list[str],
+        looked_up: dict[str, MarketInfo],
+        lookup_ok: bool,
+        ts_ns: int,
+    ) -> tuple[list[str], dict[str, tuple[_SubscribedMarket, str]], list[dict]]:
+        """
+        Update ``self._subs`` for one cycle. No I/O.
 
-        return diff
+        Returns (added market ids, removed {market id: (state, reason)},
+        markets-stream records: one per market in top-N or subscribed).
+        """
+        records: dict[str, dict] = {}
+
+        def record(mid: str, source: str, rank: int | None, raw: dict | None,
+                   action: str, reason: str | None, strikes: int = 0) -> None:
+            records[mid] = {
+                "market_id": mid, "source": source, "rank": rank, "raw": raw,
+                "sub": {"action": action, "reason": reason, "missing_strikes": strikes},
+            }
+
+        # 1. This cycle's top-N: subscribe new ones, refresh the rest.
+        added: list[str] = []
+        for rank, (mid, info) in enumerate(top.items(), start=1):
+            sub = self._subs.get(mid)
+            if sub is None:
+                self._subs[mid] = _SubscribedMarket(info, first_subscribed_ns=ts_ns, last_in_top_ns=ts_ns)
+                added.append(mid)
+                record(mid, "top", rank, info.raw, "added", None)
+            else:
+                sub.info, sub.last_in_top_ns, sub.missing_strikes = info, ts_ns, 0
+                record(mid, "top", rank, info.raw, "kept", None)
+
+        # 2. Subscribed but not in top-N: decide from the by-id lookup.
+        removed: dict[str, tuple[_SubscribedMarket, str]] = {}
+        for mid in dropped:
+            sub = self._subs[mid]
+            if not lookup_ok:
+                record(mid, "lookup", None, None, "kept", "lookup_failed", sub.missing_strikes)
+                continue
+            info = looked_up.get(mid)
+            if info is None:
+                sub.missing_strikes += 1
+                if sub.missing_strikes >= self._missing_strikes_to_remove:
+                    removed[mid] = (sub, "not_found")
+                    record(mid, "lookup", None, None, "removed", "not_found", sub.missing_strikes)
+                else:
+                    record(mid, "lookup", None, None, "kept", "not_found", sub.missing_strikes)
+            elif not info.is_trading:
+                sub.info = info
+                removed[mid] = (sub, "ended")
+                record(mid, "lookup", None, info.raw, "removed", "ended")
+            else:
+                sub.info, sub.missing_strikes = info, 0
+                record(mid, "lookup", None, info.raw, "kept", None)
+
+        # 3. Over the cap: evict the lowest-volume markets not in this top-N.
+        #    Skipped when the lookup failed (remove nothing that cycle); the
+        #    cap is enforced again on the next successful cycle.
+        over = len(self._subs) - len(removed) - self._max_subscribed_markets
+        if over > 0 and lookup_ok:
+            candidates = sorted(
+                (mid for mid in self._subs if mid not in top and mid not in removed),
+                key=lambda mid: self._subs[mid].info.volume24hr,
+            )
+            for mid in candidates[:over]:
+                removed[mid] = (self._subs[mid], "cap")
+                records[mid]["sub"]["action"] = "removed"
+                records[mid]["sub"]["reason"] = "cap"
+
+        for mid in removed:
+            del self._subs[mid]
+        return added, removed, list(records.values())
+
+
+def _count(values) -> dict[str, int]:
+    out: dict[str, int] = defaultdict(int)
+    for v in values:
+        out[v] += 1
+    return out
 
 
 # =============================================================================
@@ -490,11 +560,10 @@ async def _main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    out_dir = Path("../data/orchestrator")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    data_dir = Path("../data/orchestrator")
 
-    async with WALWriter(data_dir=out_dir, shard_prefix_len=1) as wal:
-        orch = Orchestrator(out_dir=out_dir, wal=wal)
+    async with Walwriter(data_dir=data_dir) as wal:
+        orch = Orchestrator(wal=wal)
         await orch.start()
         try:
             # Park until Ctrl-C

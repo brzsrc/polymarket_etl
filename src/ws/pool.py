@@ -39,6 +39,9 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from src import config
+from src.common.utilities import Rec
+
 from .connection import (
     ConnectionEvent,
     EventHandler,
@@ -49,11 +52,6 @@ from .connection import (
 
 logger = logging.getLogger(__name__)
 
-# Polymarket cap is 500/connection. We use 200 to:
-# - leave 60% headroom for protocol-level overhead variance
-# - stay below ~250 where some users have reported zombie-connection issues
-# - match nautilus_trader's tested default
-DEFAULT_MAX_PER_CONNECTION = 200
 
 class WSPool:
     """
@@ -61,8 +59,8 @@ class WSPool:
 
     Use:
 
-        async def on_msg(asset_ids, raw, ts_recv, conn_id):
-            await wal_writer.write(asset_ids, raw, ts_recv)
+        async def on_msg(rec, parsed, conn_id):
+            await wal_writer.write(rec)
 
         pool = WSPool(on_message=on_msg)
         await pool.start()
@@ -75,7 +73,7 @@ class WSPool:
         self,
         on_message: MessageHandler,
         on_event: EventHandler | None = None,
-        max_per_connection: int = DEFAULT_MAX_PER_CONNECTION,
+        max_per_connection: int = config.MAX_PER_CONNECTION,
     ) -> None:
         if max_per_connection <= 0 or max_per_connection > 500:
             raise ValueError("max_per_connection must be in (0, 500]")
@@ -281,10 +279,8 @@ class WSPool:
 
     async def _dispatch_message(
         self,
-        asset_ids: tuple[str, ...],
-        raw: str,
+        rec: Rec,
         parsed: "ParsedMessage | None",
-        ts_recv: int,
         conn_id: int,
     ) -> None:
         """
@@ -301,12 +297,8 @@ class WSPool:
 
         The handler can apply its own filter if needed, but the default
         behavior is "forward everything".
-
-        await self._on_message(asset_ids, raw, msg, ts_recv, self._conn_id)
         """
-        await self._on_message_external(
-            asset_ids, raw, parsed, ts_recv, conn_id
-        )
+        await self._on_message_external(rec, parsed, conn_id)
 
 
     async def _dispatch_event(

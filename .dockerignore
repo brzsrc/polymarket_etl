@@ -1,0 +1,20 @@
+# Only requirements.txt and src/ go into the image (see Dockerfile).
+.git
+.github
+.gitignore
+.dockerignore
+.venv
+.idea
+.pytest_cache
+**/__pycache__
+**/*.pyc
+.DS_Store
+
+# local collected data: never bake it into the image
+data
+
+tests
+scripts
+deploy
+Dockerfile
+requirements-dev.txt

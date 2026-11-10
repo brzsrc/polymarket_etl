@@ -1,0 +1,6 @@
+# Development and CI dependencies: everything needed to run the full test suite.
+# The Docker image installs only requirements.txt (the collector does not use these).
+-r requirements.txt
+numpy    # src/replay_engine/book.py (tests/replay_engine)
+pytest
+pytest-timeout    # CI: fail a hanging test with a traceback instead of hanging the job
