@@ -8,7 +8,10 @@
 # MAGIC {landing}/ws/{date}/{source_id}-{date}-{NNNNNN}.jsonl.gz
 # MAGIC ```
 # MAGIC
-# MAGIC - `source_id`：哪一次运行 / 哪台机器（`{host_id}-{8位随机}`），同一个 source 内编号 `NNNNNN` 递增
+# MAGIC - `source_id`：哪个采集目录（data dir）/ 哪台机器（`{host_id}-{8位随机}`），同一个 source 内编号 `NNNNNN` 递增。
+# MAGIC   它在 data dir 第一次使用时生成并保存在 `{data_dir}/.source_id`，**不是每次运行一个**：
+# MAGIC   同一个 data dir 跑多次（比如本地重启），source_id 相同，编号接着往下排；
+# MAGIC   Databricks Job 每次用新的临时目录，所以每次运行碰巧会是一个新的 source_id。
 # MAGIC - 一行 WAL = 一行 bronze，内容原样保留（`raw` 不解析），只补充时间和来源信息
 # MAGIC
 # MAGIC ## 打个比方：公司收发室
@@ -130,7 +133,7 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     raw             STRING        COMMENT 'WebSocket 原始消息体，不解析',
     -- 来源信息
     wal_date        STRING        COMMENT '路径里的日期目录',
-    source_id       STRING        COMMENT '文件名里的 source_id：哪一次运行 / 哪台机器',
+    source_id       STRING        COMMENT '文件名里的 source_id：哪个 data dir / 哪台机器（同一个 data dir 多次运行共用）',
     wal_seg         INT           COMMENT '文件名里的 segment 编号（同一 source 内递增）',
     _source_file    STRING        COMMENT '来源文件完整路径',
     _source_mtime   TIMESTAMP     COMMENT '来源文件修改时间',
@@ -287,8 +290,9 @@ LIMIT 50
 
 # COMMAND ----------
 
-# 每天、每个 source（每次运行 / 每台机器）导入了多少行、多少个 segment。
-# n_rows 应该等于 run_collector 输出的 stats["wal"]["messages"]；
+# 每天、每个 source（每个 data dir / 每台机器）导入了多少行、多少个 segment。
+# 如果这个 source 当天只跑了一次，n_rows 应该等于 run_collector 输出的 stats["wal"]["messages"]；
+# 跑了多次时是几次运行的总和。
 # n_files 应该等于 max_seg - min_seg + 1（中间没有缺编号）
 display(spark.sql(f"""
 SELECT wal_date, source_id,

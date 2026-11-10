@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from src.market.gamma_client import GammaClient, GammaError
+from src.market.gamma_client import GammaClient, GammaError, MarketSnapshot
 from src.common.utilities import Rec, now_ns
 from src.wal.writer import Walwriter
 from src.ws.connection import ConnectionEvent
@@ -415,9 +415,8 @@ class Orchestrator:
         cycle_started_at = datetime.now(timezone.utc)
         try:
             async with GammaClient() as client:
-                market_ids, asset_ids, raws = await client.fetch_top_n_by_volume24h(
-                    n=self._n_markets
-                )
+                raws = await client.top_markets_by_volume24h(n=self._n_markets)
+            snap = MarketSnapshot.from_raws(raws)
         except GammaError as e:
             # Mid-pagination failure — half-baked data is worse than no
             # data because it would trigger spurious to_remove. Skip cycle.
@@ -435,7 +434,7 @@ class Orchestrator:
             # is the more important task.
             logger.exception("write_market_snapshot failed")
 
-        seen = set(asset_ids)
+        seen = set(snap.token_ids)
 
         # Compute diff
         added = seen - self._current_subscriptions

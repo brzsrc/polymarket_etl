@@ -4,34 +4,33 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
 import msgspec
 
-from src.market.market_model import Market, parse_binary_market
-
 GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
 
-# Empirically determined: API enforces 1000 even if you ask for more.
-MAX_LIMIT = 1000
+# Cursor-paginated endpoint. The old offset-based `/markets` is deprecated
+# (response headers: `Deprecation: true`, `Sunset: 2026-05-01`,
+# `Warning: use /markets/keyset`): it now returns at most 100 rows per page
+# whatever `limit` says, and `?id=` lookups return incomplete results.
+# Docs: https://docs.polymarket.com/api-reference/markets/list-markets-keyset-pagination
+MARKETS_PATH = "/markets/keyset"
 
-# When querying by `?id=...&id=...`, the bottleneck isn't the server-side page
-# cap (1000) — it's nginx's URI length limit (~8KB; we hit 414 around 800 ids
-# of 7 digits each). 500 keeps the URL under ~5.5KB with comfortable headroom
-# for longer ids in the future.
-ID_BATCH_SIZE = 500
+# Server-side cap on `limit` for /markets/keyset (documented: max 100).
+MAX_LIMIT = 100
+
+# Each identifier filter (`id`, `clob_token_ids`, ...) accepts at most 100 values.
+ID_BATCH_SIZE = 100
 # Conservative timeouts. Gamma is usually fast (<200ms) but can spike.
 DEFAULT_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0)
 
-# Filter shorthand we end up using all over.
-ACTIVE_OB_FILTER: dict[str, Any] = {
-    "active": "true",
-    "closed": "false",
-    "archived": "false",
-    "enable_order_book": "true",
-    "accepting_orders": "true",
-}
+# Transient failures worth retrying: server hiccups and rate limiting. Other
+# 4xx (400, 404, 422...) mean our request is wrong, so retrying is pointless.
+RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 logger = logging.getLogger(__name__)
 
@@ -40,343 +39,357 @@ class GammaError(Exception):
     """Raised for unrecoverable Gamma API errors."""
 
 
+# =============================================================================
+# 模块级纯函数：不依赖 client，单独就能测试
+# =============================================================================
+
+def parse_json_list(value: Any) -> list:
+    """
+    把 Gamma 的"JSON 字符串字段"解析成 list。
+
+    Gamma 返回的 `outcomes`、`clobTokenIds` 等字段是 JSON 编码的字符串，
+    例如字面上是 `'["Yes", "No"]'` 而不是 `["Yes", "No"]`。偶尔已经是 list。
+    两种都处理；其他类型直接抛错，方便发现 schema 变化。
+
+    返回: list，元素类型保持 JSON 里的原样。
+
+    例子:
+        None              -> []
+        ""                -> []
+        '["Yes", "No"]'   -> ["Yes", "No"]
+        ["Yes", "No"]     -> ["Yes", "No"]      # 已经是 list，原样返回
+        123               -> 抛 TypeError
+        "not json"        -> 抛 json.JSONDecodeError
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        if not value:
+            return []
+        return json.loads(value)
+    raise TypeError(f"Unexpected type for JSON-string field: {type(value).__name__}")
+
+
+def token_ids_of(raw: dict[str, Any]) -> list[str]:
+    """
+    取出一个 raw market 的 CLOB token id（= WebSocket 订阅用的 asset id）。
+
+    返回: list[str]。二元市场一般是 2 个 [Yes token, No token]，顺序和
+    `outcomes` 对应。字段缺失或格式不对时返回 []，并记一条 warning，
+    不抛异常（只跳过这一个 market，不影响整轮）。
+
+    例子:
+        {"id": "3215007", "clobTokenIds": '["428657...8601", "807735...7796"]'}
+                                                  -> ["428657...8601", "807735...7796"]
+        {"id": "1"}                               -> []      # 没有 clobTokenIds
+        {"id": "1", "clobTokenIds": "not json"}   -> []      # 解析失败
+        {"clobTokenIds": '["a", "", 5]'}          -> ["a"]   # 空串和非 str 被过滤
+    """
+    try:
+        token_ids = parse_json_list(raw.get("clobTokenIds"))
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("bad clobTokenIds for market %s: %r", raw.get("id"), raw.get("clobTokenIds"))
+        return []
+    return [t for t in token_ids if isinstance(t, str) and t]
+
+
+# =============================================================================
+# MarketSnapshot：一轮 discovery 的结果
+# =============================================================================
+
+@dataclass
+class MarketSnapshot:
+    """
+    一轮 discovery 拿到的 market，以及从中提取出的 id。
+
+    用 `MarketSnapshot.from_raws(raws)` 构造，不用手动填三个列表。
+    """
+
+    raws: list[dict[str, Any]]   # 原始 market dict，按 volume24h 降序
+    market_ids: list[str]        # 和 raws 一一对应（同下标是同一个 market）
+    token_ids: list[str]         # token_ids = asset ids（WebSocket 订阅用的 id）。
+                                 # 所有 market 的 token 拼在一起，不和 raws 一一对应；
+                                 # 要知道某个 token 属于哪个 market，看 raws[i]["clobTokenIds"]
+
+    @classmethod
+    def from_raws(cls, raws: list[dict[str, Any]]) -> "MarketSnapshot":
+        """
+        例子:
+            MarketSnapshot.from_raws([{"id": "3215007", "clobTokenIds": '["a", "b"]'},
+                                      {"id": "3215008", "clobTokenIds": '["c", "d"]'}])
+            -> MarketSnapshot(raws=[...2 个 dict...],
+                              market_ids=["3215007", "3215008"],
+                              token_ids=["a", "b", "c", "d"])
+        """
+        return cls(
+            raws=raws,
+            market_ids=[str(r["id"]) for r in raws],
+            token_ids=[t for r in raws for t in token_ids_of(r)],
+        )
+
+
+# =============================================================================
+# GammaClient
+# =============================================================================
+
 class GammaClient:
     """
-    Thin async client for the Gamma `/markets` endpoint.
+    Gamma `/markets/keyset` 的轻量异步 client。
 
-    The client only deals in *raw records* internally; parsing into `Market`
-    happens at the boundary of public methods. That keeps one parsing path
-    (`parse_binary_market`) instead of letting parse logic creep into the
-    HTTP layer.
+    分三层，每层只做一件事:
+        _request          发一次 HTTP 请求（带重试）
+        _iter_markets     跟着 cursor 翻页，逐条给出 raw market
+        公开查询方法       决定"查什么、怎么筛"，只返回 raw dict
+
+    raw dict 原样返回，不解析；它们会被原样写进 WAL，下游再解析。
+
+    用法:
+        async with GammaClient() as client:
+            raws = await client.top_markets_by_volume24h(n=50)
+        snap = MarketSnapshot.from_raws(raws)
     """
 
-    def __init__(self) -> None:
-        self._base_url = GAMMA_BASE_URL
-        self._page_size = MAX_LIMIT
+    # --- 生命周期 ----------------------------------------------------------
+
+    def __init__(
+        self,
+        *,
+        base_url: str = GAMMA_BASE_URL,
+        page_size: int = MAX_LIMIT,
+        max_retries: int = 4,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        """
+        transport: 测试时传 `httpx.MockTransport(handler)`，不连真实 API。
+                   正常使用不用传。
+        """
+        self._base_url = base_url
+        self._page_size = page_size
+        self._max_retries = max_retries
+        self._transport = transport
         self._timeout = DEFAULT_TIMEOUT
         self._client: httpx.AsyncClient | None = None
-        self._max_retries = 4
         # msgspec is dramatically faster than stdlib json for our payload size.
         self._json_decoder = msgspec.json.Decoder()
 
     async def __aenter__(self) -> "GammaClient":
+        """返回 self，同时创建内部的 httpx.AsyncClient。"""
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
             timeout=self._timeout,
+            transport=self._transport,
             headers={"Accept": "application/json", "User-Agent": "polymarket-wal/0.1"},
         )
         return self
 
     async def __aexit__(self, *_exc: Any) -> None:
+        """关闭 HTTP 连接。返回 None，with 块里的异常会继续往外抛。"""
         if self._client is not None:
             await self._client.aclose()
             self._client = None
 
-    # --- HTTP layer --------------------------------------------------------
+    # --- 传输层：只负责"发一次请求 + 重试" ----------------------------------
 
-    async def _get_page(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+    async def _request(self, params: dict[str, Any]) -> dict[str, Any]:
         """
-        One GET /markets call with retry on network errors.
-        Returns the decoded JSON list (possibly empty); raises GammaError on
-        non-200 responses or after retry budget is exhausted.
+        GET /markets/keyset 一次，返回解码后的响应 body（只有一页）。
+
+        返回: dict，例如
+            {"$schema": "https://gamma-api.polymarket.com/schemas/MarketsKeysetListResponse.json",
+             "markets": [{...raw market...}, ...],   # 最多 limit 条
+             "next_cursor": "9CFyipZ_XXmei6zz..."}   # 最后一页没有这个 key
+
+        出错时:
+            - 网络错误或 429/5xx：重试最多 max_retries 次（等 0.5s、1s、2s、4s），
+              还失败就抛 GammaError
+            - 其他非 200（例如 422）：立刻抛 GammaError
+            - 不在 async with 里调用：抛 RuntimeError
         """
         if self._client is None:
             raise RuntimeError("GammaClient must be used as an async context manager")
 
-        # HTTP statuses we retry. Server-side hiccups (500/502/503/504) and
-        # rate limiting (429) are transient — retrying with backoff usually
-        # works. Other 4xx (400 bad request, 404 not found, 401 unauthorized)
-        # indicate our request is wrong, no point retrying.
-        retryable_statuses = {429, 500, 502, 503, 504}
         attempt = 0
         while True:
             try:
-                resp = await self._client.get("/markets", params=params)
+                resp = await self._client.get(MARKETS_PATH, params=params)
             except httpx.RequestError as e:
-                if attempt >= self._max_retries:
-                    raise GammaError(f"Network error after {attempt} retries: {e}") from e
-                await asyncio.sleep(0.5 * (2 ** attempt))
-                attempt += 1
-                continue
+                failure = f"network error: {e}"
+                cause: Exception | None = e
+            else:
+                if resp.status_code == 200:
+                    # Decode bytes directly with msgspec — saves a string roundtrip.
+                    return self._json_decoder.decode(resp.content)
+                if resp.status_code not in RETRYABLE_STATUSES:
+                    raise GammaError(f"Gamma returned {resp.status_code}: {resp.text[:200]}")
+                failure = f"Gamma returned {resp.status_code}: {resp.text[:200]}"
+                cause = None
 
-            if resp.status_code == 200:
-                # Decode bytes directly with msgspec — saves a string roundtrip.
-                return self._json_decoder.decode(resp.content)
+            if attempt >= self._max_retries:
+                raise GammaError(f"{failure} (after {attempt} retries)") from cause
+            # Gamma doesn't usually send Retry-After, so we don't read it; the
+            # 0.5s base doubling is fast enough.
+            await asyncio.sleep(0.5 * (2 ** attempt))
+            attempt += 1
 
-            if resp.status_code in retryable_statuses:
-                if attempt >= self._max_retries:
-                    raise GammaError(
-                        f"Gamma returned {resp.status_code} after {attempt} retries: "
-                        f"{resp.text[:200]}"
-                    )
-                # Same backoff schedule as for network errors. For 429, the
-                # server may send a Retry-After header — we don't honor it
-                # explicitly because Gamma typically doesn't, and our 0.5s
-                # base doubles fast enough.
-                await asyncio.sleep(0.5 * (2 ** attempt))
-                attempt += 1
-                continue
+    # --- 分页层：只负责"跟着 cursor 走" ------------------------------------
 
-            raise GammaError(f"Gamma returned {resp.status_code}: {resp.text[:200]}")
-
-
-
-    def _parse_json_string_field(self, value: Any) -> list:
-        """
-        Gamma returns `outcomes`, `clobTokenIds` etc. as a JSON-encoded string,
-        e.g. literally `'["Yes", "No"]'` not `["Yes", "No"]`. Sometimes (rarely)
-        it's already a list. Handle both; raise on anything else so we notice
-        schema drift.
-        """
-        if value is None:
-            return []
-        if isinstance(value, list):
-            return value
-        if isinstance(value, str):
-            if not value:
-                return []
-            return json.loads(value)
-        raise TypeError(f"Unexpected type for JSON-string field: {type(value).__name__}")
-
-    def _parse_raw(self, raw: dict[str, Any]) -> list[str] | None:
-        """
-        Parse one raw Gamma market dict into its list of tokenids.
-        """
-        try:
-            token_ids_list = self._parse_json_string_field(raw.get("clobTokenIds"))
-        except (json.JSONDecodeError, TypeError):
-            return None
-
-        return token_ids_list
-
-    async def _iter_raw_pages(
+    async def _iter_markets(
         self,
-        base_params: dict[str, Any],
+        params: dict[str, Any],
         max_count: int | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """
-        Walk `/markets` with offset-based pagination, yielding raw dicts.
+        逐页请求 /markets/keyset，一条一条给出 raw market dict。
 
-        - `base_params` is sent on every page; we add `limit` and `offset`.
-        - Stops on empty page, short page (< page_size), or after `max_count`
-          records have been yielded.
+        - `params` 每页都会带上；这里再加 `limit`，从第二页起加 `after_cursor`
+          （上一页的 `next_cursor`）。
+        - 停止条件：某页没有 `next_cursor`（最后一页）、某页为空、
+          或已经给出 `max_count` 条。
 
-        Single pagination path used by every fetch method. Don't add
-        another one.
+        返回: 异步生成器（不是 list），要用 `async for` 迭代。调用时不会发请求，
+        开始迭代才发；调用方 break 后不会再请求后面的页。
+
+        所有查询方法都走这一条分页路径，不要再加第二条。
+
+        例子:
+            [r["id"] async for r in client._iter_markets(
+                {"order": "volume24hr", "ascending": "false"}, max_count=3)]
+            -> ["3215007", "3215008", "3215009"]
         """
-        offset = int(base_params.get("offset", 0))
+        cursor: str | None = None
         yielded = 0
 
         while True:
-            remaining = None if max_count is None else max_count - yielded
-            if remaining is not None and remaining <= 0:
-                return
+            page_params = {**params, "limit": self._page_size}
+            if cursor:
+                page_params["after_cursor"] = cursor
 
-            page_size = self._page_size if remaining is None else min(self._page_size, remaining)
-
-            params = {**base_params, "limit": page_size, "offset": offset}
-
-            page = await self._get_page(params)
-            if not page:
-                return
-
+            body = await self._request(page_params)
+            page = body.get("markets") or []
             for raw in page:
                 yield raw
                 yielded += 1
                 if max_count is not None and yielded >= max_count:
                     return
 
-            # Short page → no more results. Saves one round-trip vs. waiting
-            # for an empty response.
-            if len(page) < page_size:
+            cursor = body.get("next_cursor")
+            if not page or not cursor:
                 return
 
-            offset += page_size
+    # --- 公开查询：只返回 raw dict，不做 token 提取 ---------------------------
 
-    # --- Public: iterators -------------------------------------------------
-
-    async def iter_markets(
-        self,
-        filters: dict[str, Any] | None = None,
-        max_count: int | None = None,
-    ) -> AsyncIterator[tuple[Market, dict[str, Any]]]:
-        """
-        Iterate over markets matching `filters` (default ACTIVE_OB_FILTER),
-        if max_count = None, then iter all markets,
-        yielding only those that parse as binary markets.
-
-        Yields `(Market, raw_dict)`.
-        """
-        params = dict(filters) if filters is not None else dict(ACTIVE_OB_FILTER)
-        async for raw in self._iter_raw_pages(params, max_count=max_count):
-            market = parse_binary_market(raw)
-            if market is None:
-                continue
-            yield market, raw
-
-    # --- Public: top-N -----------------------------------------------------
-
-    async def fetch_top_n_by_volume24h(
+    async def top_markets_by_volume24h(
         self,
         n: int | None = None,
         accepting_orders_only: bool = True,
-    ) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+    ) -> list[dict[str, Any]]:
         """
-        Fetch markets sorted by 24h volume (descending).
+        按 24h 成交量从高到低取开放中的 market。
 
-        - `n=None` → fetch ALL matching markets (paginates until Gamma
-          returns an empty/short page). For `accepting_orders_only=True`
-          this is currently ~47k records and takes ~30-40s.
-        - `n=N`   → fetch only the first N (still paginated internally
-          for N > 1000).
+        - `n=None` → 取全部开放 market（翻到最后一页）
+        - `n=N`    → 保留够 N 个就停
+        - n <= 0   → 返回 []，不发请求
 
-        Pagination under `order=volume24hr` is *mostly* stable but not
-        perfectly — a market whose 24h volume changes between page fetches
-        can appear on two pages. We dedup by id; when `n` is set, we fetch
-        a small overshoot so dedup losses don't underfill the result.
+        返回: list[dict]，raw market dict，按 volume24h 降序。
+        需要 market id / token id 时用 `MarketSnapshot.from_raws(...)`。
 
-        Returns market_ids, token_ids, raws
+        筛选规则（都在客户端做）:
+        - 跳过缺 `id` 或 `conditionId` 的记录
+        - `accepting_orders_only=True` 时跳过 `acceptingOrders` 不为真的。
+          /markets/keyset 没有这个过滤参数（未知参数会被静默忽略）。
+          已关闭的 market 由接口默认的 `closed=false` 排除。
+        - 按 id 去重：翻页期间某个 market 的 24h 成交量变了，理论上可能出现两次。
 
-        Note: order=volume24hr ranking is a *snapshot*. Calling this 30
-        minutes later may return a different population. For periodic
-        refreshes of the SAME markets, freeze `market_ids` once and call
-        `fetch_markets_by_ids` thereafter.
+        注意：volume24hr 排名是某一刻的快照，30 分钟后再调可能是另一批 market。
+        要定期刷新同一批 market，先把 id 固定下来，之后用 `markets_by_ids`。
+
+        例子:
+            await client.top_markets_by_volume24h(n=2)
+            -> [{"id": "3215007", "question": "Will there be no change in Fed ...?", ...},
+                {"id": "3215008", ...}]
         """
         if n is not None and n <= 0:
-            return [], [], []
+            return []
 
-        base_params: dict[str, Any] = {
-            "order": "volume24hr",
-            "ascending": "false",
-        }
-        if accepting_orders_only:
-            base_params["acceptingOrders"] = "true"
+        params: dict[str, Any] = {"order": "volume24hr", "ascending": "false"}
 
-        # Overshoot when a hard cap is set, to absorb dedup loss. When
-        # n is None, we want everything — no cap.
-        max_fetch = None if n is None else n + 50
-
-        market_ids: list[str] = []
-        token_ids: list[str] = []
-        raws: list[dict[str, Any]] = []
+        out: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
-        async for raw in self._iter_raw_pages(base_params, max_count=max_fetch):
+        async for raw in self._iter_markets(params):
             mid = raw.get("id")
-            condition_id = raw.get("conditionId")
-            if mid is None or condition_id is None:
+            if mid is None or raw.get("conditionId") is None:
+                continue
+            if accepting_orders_only and not raw.get("acceptingOrders"):
                 continue
             mid_s = str(mid)
-
             if mid_s in seen_ids:
                 continue
             seen_ids.add(mid_s)
 
-            market_ids.append(mid_s)
-            token_ids.extend(self._parse_raw(raw))
-            raws.append(raw)
-
-            if n is not None and len(market_ids) >= n:
+            out.append(raw)
+            if n is not None and len(out) >= n:
                 break
-        return market_ids, token_ids, raws
+        return out
 
-    # --- Public: by-id snapshot -------------------------------------------
-
-    async def fetch_markets_by_ids(
-        self,
-        market_ids: list[str],
-    ) -> dict[str, dict[str, Any]]:
+    async def markets_by_ids(self, ids: list[str]) -> dict[str, dict[str, Any]]:
         """
-        Fetch raw Gamma records for a list of market ids.
+        按 market id 查 raw 记录，开放和已关闭的都返回（`closed=any`）。
 
-        Returns a dict mapping id -> raw record.
+        返回: dict[str, dict]，market id（str）-> raw dict。
+        只包含 Gamma 实际返回的 id；不存在 / 已删除的 id 不会出现，
+        和输入对比就能找出来。
 
-        Remove  duplicates in market_ids.
+        - 输入里重复的 id 只查一次
+        - 非纯数字的 id 跳过并记 warning：`id` 过滤会把每个值当 int 校验，
+          有一个不合法就整个请求 422
+        - 每批最多 ID_BATCH_SIZE（100）个 id
+        - 不传 `closed=any` 的话，接口默认 `closed=false`，
+          已结束的 market 会和不存在的 id 一样查不到
 
-        Ids that Gamma doesn't return (deleted / unknown) are simply absent
-        — diff against input to find them.
-
-        Implementation notes (all learned the hard way):
-        - Gamma's `/markets` accepts repeated `?id=...` params and returns
-          matching records, but the default `limit` (20) silently truncates.
-          We always set `limit=len(batch)`.
-        - The `id` filter validates each value as int. A single non-numeric
-          id makes the WHOLE request fail with HTTP 422. We pre-filter
-          non-numeric ids and log a warning rather than tank the batch.
-        - Chunked at ID_BATCH_SIZE (500) per request — bounded by nginx's
-          URI length limit, NOT by the server-side page cap.
+        例子:
+            await client.markets_by_ids(["3215007", "3215007", "abc", "12", "999999999999"])
+            -> {"3215007": {"id": "3215007", "closed": False, ...},
+                "12":      {"id": "12", "closed": True, ...}}
         """
-        if self._client is None:
-            raise RuntimeError("GammaClient must be used as an async context manager")
-
-        # Dedup while preserving order; drop non-numeric ids (see note above).
         seen: set[str] = set()
-        unique_ids: list[str] = []
-        for x in market_ids:
+        valid_ids: list[str] = []
+        for x in ids:
             s = str(x)
             if s in seen:
                 continue
             seen.add(s)
             if not s.isdigit():
-                logger.warning("fetch_markets_by_ids: skipping non-numeric id %r", s)
+                logger.warning("markets_by_ids: skipping non-numeric id %r", s)
                 continue
-            unique_ids.append(s)
+            valid_ids.append(s)
 
         out: dict[str, dict[str, Any]] = {}
-        for start in range(0, len(unique_ids), ID_BATCH_SIZE):
-            batch = unique_ids[start:start + ID_BATCH_SIZE]
-            params: dict[str, Any] = {"id": batch, "limit": len(batch)}
-            page = await self._get_page(params)
-            for raw in page:
+        for start in range(0, len(valid_ids), ID_BATCH_SIZE):
+            batch = valid_ids[start:start + ID_BATCH_SIZE]
+            async for raw in self._iter_markets({"id": batch, "closed": "any"}):
                 mid = raw.get("id")
                 if mid is not None:
                     out[str(mid)] = raw
         return out
 
-    # --- Public: full discovery cycle -------------------------------------
-
-    async def fetch_all_active_binary_markets(
-        self,
-        filters: dict[str, Any] | None = None,
-    ) -> tuple[list[Market], list[dict[str, Any]]]:
-        """
-        Pull every page of `filters` (default: ACTIVE_OB_FILTER) from Gamma,
-        keeping only tradeable binary markets.
-
-        Returns `(parsed_markets, raw_records)` — parallel lists.
-
-        Persistence of the raw records is the caller's responsibility —
-        pass them to `Walwriter.write_market_snapshot` (src/wal/writer.py)
-        if you want a history log. Keeping IO out of the client makes it usable from
-        contexts (tests, ad-hoc scripts) that don't want a file on disk.
-
-        Raises `GammaError` on mid-pagination failure. Half-baked results
-        are worse than no results because they'd wrongly trigger to_remove
-        for markets that just happened to be on later pages.
-        """
-        parsed_markets: list[Market] = []
-        raw_records: list[dict[str, Any]] = []
-
-        async for market, raw in self.iter_markets(filters=filters):
-            parsed_markets.append(market)
-            raw_records.append(raw)
-
-        logger.info("fetch_all_active_binary_markets: %d markets", len(parsed_markets))
-        return parsed_markets, raw_records
-
 
 # --- Quick smoke test --------------------------------------------------------
 
 async def _main() -> None:
+    """拉取全部开放 market，每个 raw dict 一行写到 <项目根>/data/active_markets.jsonl。"""
     async with GammaClient() as client:
-        market_ids, token_ids, raws = await client.fetch_top_n_by_volume24h()
-        print(f"top 2500 by volume24hr: got {len(market_ids)} ids")
+        raws = await client.top_markets_by_volume24h()
+    snap = MarketSnapshot.from_raws(raws)
+    print(f"all open markets by volume24hr: {len(snap.market_ids)} markets, "
+          f"{len(snap.token_ids)} token ids")
 
-
-    with open("../../data/active_markets.jsonl", "w", encoding="utf-8") as f:
-        for item in raws:
+    out_path = Path(__file__).resolve().parents[2] / "data" / "active_markets.jsonl"
+    with out_path.open("w", encoding="utf-8") as f:
+        for item in snap.raws:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
-
-
+    print(f"wrote {out_path}")
 
 
 if __name__ == "__main__":

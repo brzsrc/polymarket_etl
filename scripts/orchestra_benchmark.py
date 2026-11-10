@@ -42,7 +42,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from src.market.gamma_client import GammaClient
+from src.market.gamma_client import GammaClient, token_ids_of
 from src.wal.writer import Walwriter
 from src.ws.connection import ConnectionEvent, WSConnection
 from src.common.utilities import Rec, now_ns
@@ -382,13 +382,9 @@ async def main() -> None:
 
     # ---- Discover the universe ONCE; both setups use the same asset_ids ----
     async with GammaClient() as client:
-        ids, results = await client.fetch_top_n_by_volume24h(n=TOP_N_MARKETS)
-    asset_ids: list[str] = []
-    per_market_assets: list[list[str]] = []
-    for _market, raw in results:
-        tids = json.loads(raw["clobTokenIds"])
-        per_market_assets.append([str(t) for t in tids])
-        asset_ids.extend(str(t) for t in tids)
+        raws = await client.top_markets_by_volume24h(n=TOP_N_MARKETS)
+    per_market_assets: list[list[str]] = [token_ids_of(raw) for raw in raws]
+    asset_ids: list[str] = [t for tids in per_market_assets for t in tids]
 
     if len(per_market_assets) != TOP_N_MARKETS:
         log.warning("got %d markets, expected %d", len(per_market_assets), TOP_N_MARKETS)
