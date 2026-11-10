@@ -40,6 +40,11 @@ from src.wal.uploader import STAGING_DIR, check_rel, staging_name
 
 logger = logging.getLogger(__name__)
 
+# Upload in pieces of this size. The SDK reads one piece into memory at a time;
+# its default is 100 MB, too much next to a 1 GiB segment (~190 MB gzipped) on
+# a 1 GiB VM. 8 MB keeps memory flat; same-region throughput barely changes.
+UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
+
 # abfss://<file system>@<host>[/<prefix>]
 _ABFSS_RE = re.compile(r"^abfss://(?P<fs>[^@/]+)@(?P<host>[^/]+)(?:/(?P<prefix>.*))?$")
 
@@ -123,7 +128,8 @@ class AdlsPut:
         tmp = self._fs.get_file_client(self.location.path(f"{STAGING_DIR}/{staging_name(rel)}"))
         try:
             with open(local, "rb") as fh:
-                tmp.upload_data(fh, length=size, overwrite=True)
+                tmp.upload_data(fh, length=size, overwrite=True,
+                                chunk_size=UPLOAD_CHUNK_BYTES, max_concurrency=1)
             remote_size = tmp.get_file_properties().size
             if remote_size != size:
                 raise OSError(f"size mismatch uploading {local}: local {size} B, remote {remote_size} B")

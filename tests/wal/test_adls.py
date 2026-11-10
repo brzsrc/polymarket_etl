@@ -20,7 +20,8 @@ import pytest
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 
 from src.common.utilities import Rec
-from src.wal.adls import AdlsLocation, AdlsPut
+import src.wal.adls as adls
+from src.wal.adls import UPLOAD_CHUNK_BYTES, AdlsLocation, AdlsPut
 from src.wal.uploader import Uploader
 from src.wal.writer import Walwriter
 
@@ -41,6 +42,7 @@ class FakeFs:
         self.files: dict[str, bytes] = {}
         self.dirs: set[str] = set()
         self.calls: list[tuple] = []
+        self.upload_kwargs: list[dict] = []
         self.fail: dict[str, Exception] = {}
         self.truncate_upload = False           # simulate a short upload
         self.rename_overwrites = rename_overwrites
@@ -69,8 +71,9 @@ class FakeFile:
     def __init__(self, fs: FakeFs, path: str):
         self.fs, self.path_name = fs, path
 
-    def upload_data(self, data, length=None, overwrite=False):
+    def upload_data(self, data, length=None, overwrite=False, chunk_size=None, max_concurrency=None):
         self.fs.calls.append(("upload", self.path_name))
+        self.fs.upload_kwargs.append({"chunk_size": chunk_size, "max_concurrency": max_concurrency})
         self.fs._maybe_fail("upload")
         body = data.read()
         assert length == len(body)
@@ -346,6 +349,30 @@ def test_real_sdk_request_sequence(tmp_path):
     rename_headers = http.requests[-1][3]
     assert rename_headers["x-ms-rename-source"].endswith(f"/{FS}/{STAGING}")
     assert "if-none-match" not in rename_headers        # no condition -> ADLS overwrites an existing target
+
+
+def test_upload_is_chunked_to_bound_memory(tmp_path):
+    # The SDK default reads 100 MB at a time; AdlsPut asks for small pieces.
+    fs = FakeFs()
+    AdlsPut(URL, file_system_client=fs)(local_file(tmp_path), REL)
+    assert fs.upload_kwargs == [{"chunk_size": UPLOAD_CHUNK_BYTES, "max_concurrency": 1}]
+    assert UPLOAD_CHUNK_BYTES <= 16 * 1024 * 1024
+
+
+def test_real_sdk_uploads_large_file_in_pieces(tmp_path, monkeypatch):
+    # With the real SDK, a file larger than one piece goes up as several
+    # appends (each one piece in memory) and arrives byte-identical.
+    monkeypatch.setattr(adls, "UPLOAD_CHUNK_BYTES", 1000)
+    data = os.urandom(4500)
+    http = FakeDfsEndpoint()
+    svc = DataLakeServiceClient("https://acct.dfs.core.windows.net",
+                                credential=AzureNamedKeyCredential("acct", "a2V5"), transport=http)
+    AdlsPut(URL, file_system_client=svc.get_file_system_client(FS))(local_file(tmp_path, data), REL)
+
+    appends = [(q.get("position"), h.get("content-length"))
+               for m, p, q, h in http.requests if q.get("action") == "append"]
+    assert appends == [("0", "1000"), ("1000", "1000"), ("2000", "1000"), ("3000", "1000"), ("4000", "500")]
+    assert http.files == {FINAL: data}
 
 
 # --- live (opt-in) -------------------------------------------------------------------------
