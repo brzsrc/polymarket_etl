@@ -516,3 +516,55 @@ def test_upload_markers_count_for_numbering(tmp_path):
 
     run(go())
     assert "000002.jsonl" in names(day)
+
+
+# --- races found on CI ---------------------------------------------------------------------
+
+def test_wait_seals_returns_when_a_task_finished_but_its_callback_has_not_run(tmp_path):
+    # Exact state of the CI hang: a seal task is done, but its discard callback
+    # is still queued, so the task is still in _seal_tasks. The old wait_seals
+    # re-awaited gather() on it, which never yields, so the callback never ran
+    # and it looped forever.
+    async def go():
+        w = Walwriter(tmp_path)
+
+        async def seal():
+            pass
+
+        t = asyncio.create_task(seal())
+        w._seal_tasks.add(t)
+        t.add_done_callback(w._seal_tasks.discard)
+        await asyncio.sleep(0)          # t runs and finishes; its discard is now queued
+        assert t.done() and t in w._seal_tasks
+        await w.wait_seals()            # must return without spinning
+        await asyncio.sleep(0)          # let the queued discard run
+        return t in w._seal_tasks
+
+    assert run(asyncio.wait_for(go(), 5)) is False
+
+
+def test_seal_ok_when_gz_is_taken_right_after_rename(tmp_path, monkeypatch):
+    # The uploader may upload and delete the new .gz as soon as it appears.
+    # Sealing must still count as a success (it used to stat the .gz afterwards
+    # and fail with FileNotFoundError).
+    import src.wal.writer as writer
+
+    src = tmp_path / "000000.jsonl"
+    src.write_bytes(b'{"a":1}\n{"a":2}\n')
+    final = tmp_path / "000000.jsonl.gz"
+    real_fsync_dir = writer._fsync_dir
+    taken = {}
+
+    def fsync_dir_then_uploader_takes_gz(d):
+        real_fsync_dir(d)
+        if final.exists() and not taken:
+            taken["bytes"] = final.read_bytes()
+            final.unlink()
+
+    monkeypatch.setattr(writer, "_fsync_dir", fsync_dir_then_uploader_takes_gz)
+    raw, gz, torn = writer._seal_file(src)
+
+    assert (raw, torn) == (16, 0)
+    assert gz == len(taken["bytes"]) > 0
+    assert gzip.decompress(taken["bytes"]) == b'{"a":1}\n{"a":2}\n'
+    assert not src.exists()
