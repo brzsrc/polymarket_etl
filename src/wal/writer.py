@@ -429,8 +429,13 @@ class Walwriter:
 
     async def wait_seals(self) -> None:
         """Wait until every in-flight seal has finished."""
-        while self._seal_tasks:
-            await asyncio.gather(*list(self._seal_tasks), return_exceptions=True)
+        # Wait only for tasks that are not done yet. A finished task stays in
+        # the set until its discard callback runs on the next loop iteration;
+        # waiting on it again would not yield (gather of done futures returns
+        # an already-done future since Python 3.12), so the callback would
+        # never run and this loop would spin forever.
+        while pending := [t for t in self._seal_tasks if not t.done()]:
+            await asyncio.wait(pending)
 
     # ------------------------------------------------------------------
     # Rotation and sealing
@@ -595,6 +600,9 @@ def _seal_file(src: Path) -> tuple[int, int, int] | None:
                     remaining -= len(chunk)
             fout.flush()
             os.fsync(fout.fileno())
+            # Size taken before the rename: once final exists the uploader may
+            # upload and delete it at any moment.
+            gz_size = os.fstat(fout.fileno()).st_size
         os.replace(tmp, final)
         _fsync_dir(src.parent)
     except BaseException:
@@ -602,7 +610,7 @@ def _seal_file(src: Path) -> tuple[int, int, int] | None:
         raise
     src.unlink()
     _fsync_dir(src.parent)
-    return size, final.stat().st_size, size - valid
+    return size, gz_size, size - valid
 
 
 def _bytes_through_last_newline(path: Path, size: int) -> int:
