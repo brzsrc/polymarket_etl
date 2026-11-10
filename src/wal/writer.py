@@ -23,7 +23,11 @@ Segment lifecycle
    crash loses at most that much data.
 3. Every ``check_interval_sec`` the background loop checks the active
    segment size. Past ``segment_max_bytes`` it is closed and the number is
-   bumped; the next write opens the next file.
+   bumped; the next write opens the next file. The same pass closes every
+   segment of an earlier UTC date once ``day_close_grace_sec`` has passed
+   since midnight, so yesterday's files are sealed and uploaded without
+   waiting for an exit. A late record for a closed date opens the next
+   number (e.g. ``000001.jsonl``), which the next pass seals too.
 4. A closed segment is sealed in a worker thread::
 
        000001.jsonl -> 000001.jsonl.gz.tmp -> fsync -> rename -> fsync dir
@@ -60,10 +64,11 @@ import gzip
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import IO, Self
+from typing import IO, Callable, Self
 
 import msgspec
 
@@ -124,6 +129,8 @@ class Walwriter:
         segment_max_bytes: int | None = config.SEGMENT_MAX_BYTES,
         check_interval_sec: float = config.CHECK_INTERVAL_SEC,
         seal_on_exit: bool = True,
+        day_close_grace_sec: float = config.DAY_CLOSE_GRACE_SEC,
+        clock_ns: Callable[[], int] | None = None,
     ) -> None:
         if fsync_interval_sec <= 0:
             raise ValueError("fsync_interval_sec must be > 0")
@@ -131,6 +138,8 @@ class Walwriter:
             raise ValueError("segment_max_bytes must be > 0 or None")
         if check_interval_sec <= 0:
             raise ValueError("check_interval_sec must be > 0")
+        if day_close_grace_sec < 0:
+            raise ValueError("day_close_grace_sec must be >= 0")
 
         self._data_dir = Path(data_dir)
         self._fsync_interval = fsync_interval_sec
@@ -141,6 +150,9 @@ class Walwriter:
         # no "next start" to seal them. False keeps them as .jsonl until the
         # next start.
         self._seal_on_exit = seal_on_exit
+        self._day_close_grace_ns = int(day_close_grace_sec * 1e9)
+        # Wall clock in ns; injectable so tests can cross midnight.
+        self._clock_ns = clock_ns or time.time_ns
 
         self._encoder = msgspec.json.Encoder()
 
@@ -423,8 +435,9 @@ class Walwriter:
             return False
 
     async def check_now(self) -> None:
-        """One maintenance pass: rotate oversized segments, seal closed ones."""
+        """One maintenance pass: rotate oversized segments, close past days, seal closed ones."""
         await self._maybe_rotate_oversized()
+        await self._close_past_days()
         self._seal_dangling_segments()
 
     async def wait_seals(self) -> None:
@@ -465,6 +478,27 @@ class Walwriter:
             next_n = seg.n
         logger.info("WAL: rotated %s, next segment %06d", closed, next_n)
         return closed
+
+    async def _close_past_days(self) -> None:
+        """
+        Close the active segments of every date before today (UTC, minus the
+        grace period). The key is dropped, so a late write for that date picks
+        the next number from disk and never reopens a file being sealed. The
+        closed files are sealed by the ``_seal_dangling_segments`` call that follows.
+        """
+        cutoff = self._date_str_from_ns(self._clock_ns() - self._day_close_grace_ns)
+        closed: list[Path] = []
+        # Pop and close under one lock hold: otherwise a write in between
+        # could reopen the key and its file handle would be lost.
+        async with self._lock:
+            for key in [k for k in self._segs if k[1] < cutoff]:   # YYYY-MM-DD sorts as text
+                seg = self._segs.pop(key)
+                if seg.fh is not None:
+                    path = self._segment_path(key, seg.n)
+                    self._close_fh(seg.fh, str(path))
+                    closed.append(path)
+        for p in closed:
+            logger.info("WAL: day over, closed %s", p)
 
     def _cleanup_orphan_tmps(self) -> None:
         """Remove .gz.tmp files left by a crash mid-seal. Their .jsonl is intact and gets resealed."""

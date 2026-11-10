@@ -12,10 +12,24 @@ from pathlib import Path
 
 from src.common.utilities import Rec
 from src.replay_engine.wal_reader import Dedup, _files, _records
+import types
+
+import pytest
+
+from src.wal import writer as writer_mod
 from src.wal.writer import Walwriter
 
 T0 = 1762560000_000000000          # 2025-11-08 00:00:00 UTC
 DATE = "2025-11-08"
+
+
+DAY_NS = 86_400 * 10**9
+
+
+@pytest.fixture(autouse=True)
+def _clock_on_test_day(monkeypatch):
+    """Default writer clock = DATE, so check_now() doesn't treat DATE as a past day."""
+    monkeypatch.setattr(writer_mod, "time", types.SimpleNamespace(time_ns=lambda: T0 + 10**9))
 
 
 def rec(i: int, aids: tuple[str, ...] = ("111", "222")) -> Rec:
@@ -568,3 +582,114 @@ def test_seal_ok_when_gz_is_taken_right_after_rename(tmp_path, monkeypatch):
     assert gz == len(taken["bytes"]) > 0
     assert gzip.decompress(taken["bytes"]) == b'{"a":1}\n{"a":2}\n'
     assert not src.exists()
+
+
+# ---------------------------------------------------------------------------
+# Closing past days
+# ---------------------------------------------------------------------------
+
+class Clock:
+    def __init__(self, ns: int) -> None:
+        self.ns = ns
+
+    def __call__(self) -> int:
+        return self.ns
+
+
+def test_past_day_closed_and_sealed_after_grace(tmp_path):
+    clock = Clock(T0 + DAY_NS - 1)        # 23:59:59.999... on DATE
+
+    async def go():
+        async with Walwriter(tmp_path, seal_on_exit=False, segment_max_bytes=None,
+                             day_close_grace_sec=60, clock_ns=clock) as w:
+            for i in range(3):
+                await w.write(rec(i))
+            await w.write_market_snapshot(T0, [{"market_id": "m1"}])
+            await w.write_event(T0, {"conn_id": 0, "event": "connect"})
+            await w.write_metrics(T0, {"msgs_total": 1})
+
+            # Next day, inside the grace period: nothing closed yet.
+            clock.ns = T0 + DAY_NS + 30 * 10**9
+            await w.check_now()
+            await w.wait_seals()
+            for stream in ("wal", "markets", "events", "metrics"):
+                assert names(tmp_path / stream / DATE) == ["000000.jsonl"], stream
+
+            # Grace period over: every stream of DATE is closed and sealed.
+            clock.ns = T0 + DAY_NS + 61 * 10**9
+            await w.check_now()
+            await w.wait_seals()
+            for stream in ("wal", "markets", "events", "metrics"):
+                assert names(tmp_path / stream / DATE) == ["000000.jsonl.gz"], stream
+            assert len(gz_lines(tmp_path / "wal" / DATE / "000000.jsonl.gz")) == 3
+
+    run(go())
+
+
+def test_today_not_closed(tmp_path):
+    clock = Clock(T0 + DAY_NS + 3600 * 10**9)   # 01:00 on the next day
+    next_day = "2025-11-09"
+
+    async def go():
+        async with Walwriter(tmp_path, seal_on_exit=False, segment_max_bytes=None,
+                             day_close_grace_sec=60, clock_ns=clock) as w:
+            await w.write(rec(0))                                   # DATE: past
+            await w.write(Rec(ts_recv_ns=T0 + DAY_NS + 1, asset_ids=("1",), raw="{}"))  # today
+            await w.check_now()
+            await w.wait_seals()
+            await w.write(Rec(ts_recv_ns=T0 + DAY_NS + 2, asset_ids=("1",), raw="{}"))
+
+    run(go())
+    assert names(tmp_path / "wal" / DATE) == ["000000.jsonl.gz"]
+    # Today's segment stayed open: the second write went into the same file.
+    assert names(tmp_path / "wal" / next_day) == ["000000.jsonl"]
+    assert len((tmp_path / "wal" / next_day / "000000.jsonl").read_bytes().splitlines()) == 2
+
+
+def test_late_record_after_day_close_goes_to_next_number(tmp_path):
+    clock = Clock(T0 + DAY_NS + 61 * 10**9)
+
+    async def go():
+        async with Walwriter(tmp_path, seal_on_exit=False, segment_max_bytes=None,
+                             day_close_grace_sec=60, clock_ns=clock) as w:
+            await w.write(rec(0))
+            await w.check_now()
+            await w.wait_seals()
+            assert names(tmp_path / "wal" / DATE) == ["000000.jsonl.gz"]
+
+            await w.write(rec(1))            # late record for DATE
+            assert names(tmp_path / "wal" / DATE) == ["000000.jsonl.gz", "000001.jsonl"]
+
+            await w.check_now()
+            await w.wait_seals()
+
+    run(go())
+    day = tmp_path / "wal" / DATE
+    assert names(day) == ["000000.jsonl.gz", "000001.jsonl.gz"]
+    # The sealed file was not touched; the late record is in its own file.
+    assert [json.loads(l)["ts_recv_ns"] for l in gz_lines(day / "000000.jsonl.gz")] == [T0]
+    assert [json.loads(l)["ts_recv_ns"] for l in gz_lines(day / "000001.jsonl.gz")] == [T0 + 1]
+
+
+def test_late_record_after_upload_does_not_reuse_number(tmp_path):
+    clock = Clock(T0 + DAY_NS + 61 * 10**9)
+    day = tmp_path / "wal" / DATE
+
+    async def go():
+        async with Walwriter(tmp_path, seal_on_exit=False, segment_max_bytes=None,
+                             day_close_grace_sec=60, clock_ns=clock) as w:
+            await w.write(rec(0))
+            await w.check_now()
+            await w.wait_seals()
+            # What the uploader leaves behind after uploading and deleting the .gz.
+            (day / "000000.jsonl.gz").unlink()
+            (day / "000000.jsonl.gz.uploaded").touch()
+            await w.write(rec(1))
+
+    run(go())
+    assert names(day) == ["000000.jsonl.gz.uploaded", "000001.jsonl"]
+
+
+def test_negative_day_close_grace_rejected(tmp_path):
+    with pytest.raises(ValueError):
+        Walwriter(tmp_path, day_close_grace_sec=-1)
