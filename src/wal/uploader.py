@@ -5,12 +5,14 @@ Local side (written by ``Walwriter``)::
 
     {data_dir}/wal/{date}/000003.jsonl.gz        sealed, waiting for upload
     {data_dir}/markets/{date}/000001.jsonl.gz
+    {data_dir}/events/{date}/000000.jsonl.gz
     {data_dir}/wal/{date}/000002.jsonl.gz.uploaded   marker left after upload
 
 Destination (``dest_root``)::
 
     ws/{date}/{source_id}-{date}-000003.jsonl.gz
     markets/{date}/{source_id}-{date}-000001.jsonl.gz
+    events/{date}/{source_id}-{date}-000000.jsonl.gz
     _staging/                                     in-flight copies, normally empty
 
 ``dest_root`` is a UC volume path (``/Volumes/...``, only on Databricks
@@ -51,31 +53,36 @@ from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import Self
 
+from src import config
+
 logger = logging.getLogger(__name__)
 
 # put(local_file, remote_rel_path). Sync; the uploader runs it in a worker thread.
 PutFn = Callable[[Path, str], None]
 
-DEFAULT_SCAN_INTERVAL_SEC = 15.0
-DEFAULT_EXIT_TIMEOUT_SEC = 300.0
-
 _SEALED_RE = re.compile(r"^(\d{6})\.jsonl\.gz$")
 _MARKER = ".uploaded"
 # local stream dir -> destination dir
-_REMOTE_STREAM = {"wal": "ws", "markets": "markets"}
+_REMOTE_STREAM = {"wal": "ws", "markets": "markets", "events": "events"}
 
 
 # ----------------------------------------------------------------------
 # put_file
 # ----------------------------------------------------------------------
 
-def _check_rel(rel: str) -> None:
+# In-flight copies go here, next to (not under) ws/ markets/ events/, so a
+# reader watching those folders never sees a partial file.
+STAGING_DIR = "_staging"
+
+
+def check_rel(rel: str) -> None:
+    """Reject remote paths that are empty, absolute or contain '..'."""
     p = PurePosixPath(rel)
     if not rel or p.is_absolute() or ".." in p.parts:
         raise ValueError(f"bad remote path: {rel!r}")
 
 
-def _staging_name(rel: str) -> str:
+def staging_name(rel: str) -> str:
     # Derived from rel and deterministic: ws/ and markets/ files with the same
     # basename don't collide, and a .tmp left by a crash is overwritten by the
     # retry instead of piling up.
@@ -91,10 +98,10 @@ def put_file(local: Path, rel: str, *, dest_root: Path) -> None:
     carries the same bytes, so re-uploads are safe. Raises on failure and
     leaves no partial file behind; the caller decides whether to retry.
     """
-    _check_rel(rel)
+    check_rel(rel)
     dest_root = Path(dest_root)
     final = dest_root / rel
-    tmp = dest_root / "_staging" / _staging_name(rel)
+    tmp = dest_root / STAGING_DIR / staging_name(rel)
     tmp.parent.mkdir(parents=True, exist_ok=True)
     final.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -113,7 +120,7 @@ def put_file(local: Path, rel: str, *, dest_root: Path) -> None:
 
 class Uploader:
     """
-    Upload sealed ``{wal,markets}/{date}/NNNNNN.jsonl.gz`` files with ``put``.
+    Upload sealed ``{wal,markets,events}/{date}/NNNNNN.jsonl.gz`` files with ``put``.
 
     - Only complete ``.jsonl.gz`` files are picked up. The writer creates them
       by rename, so they are never partial; ``.jsonl`` and ``.tmp`` are ignored.
@@ -132,9 +139,9 @@ class Uploader:
         put: PutFn,
         host_id: str,
         *,
-        scan_interval_sec: float = DEFAULT_SCAN_INTERVAL_SEC,
+        scan_interval_sec: float = config.UPLOAD_SCAN_INTERVAL_SEC,
         keep_local: bool = False,
-        exit_timeout_sec: float = DEFAULT_EXIT_TIMEOUT_SEC,
+        exit_timeout_sec: float = config.UPLOAD_EXIT_TIMEOUT_SEC,
     ) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_-]+", host_id):
             raise ValueError("host_id must match [A-Za-z0-9_-]+")

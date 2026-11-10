@@ -96,37 +96,54 @@ def token_ids_of(raw: dict[str, Any]) -> list[str]:
 
 
 # =============================================================================
-# MarketSnapshot：一轮 discovery 的结果
+# MarketInfo：一个 market 里我们会用到的字段 + 原始 dict
 # =============================================================================
 
-@dataclass
-class MarketSnapshot:
-    """
-    一轮 discovery 拿到的 market，以及从中提取出的 id。
+def _float_or_zero(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
-    用 `MarketSnapshot.from_raws(raws)` 构造，不用手动填三个列表。
+
+@dataclass(frozen=True)
+class MarketInfo:
+    """
+    一个 Gamma market：只取订阅和判断状态要用的几个字段，原始 dict 放在 `raw`。
+
+    `raw` 原样保留，写 WAL 时用它；其他字段只是从 raw 里读出来的方便访问。
+    用 `MarketInfo.from_raw(raw)` 构造。
     """
 
-    raws: list[dict[str, Any]]   # 原始 market dict，按 volume24h 降序
-    market_ids: list[str]        # 和 raws 一一对应（同下标是同一个 market）
-    token_ids: list[str]         # token_ids = asset ids（WebSocket 订阅用的 id）。
-                                 # 所有 market 的 token 拼在一起，不和 raws 一一对应；
-                                 # 要知道某个 token 属于哪个 market，看 raws[i]["clobTokenIds"]
+    id: str
+    tokens: tuple[str, ...]   # CLOB token id = WebSocket 订阅用的 asset id，顺序和 outcomes 对应
+    volume24hr: float         # 缺失或格式不对时为 0
+    is_trading: bool          # 没关闭（closed 不为真）且在接单（acceptingOrders 为真）
+    raw: dict[str, Any]
 
     @classmethod
-    def from_raws(cls, raws: list[dict[str, Any]]) -> "MarketSnapshot":
+    def from_raw(cls, raw: dict[str, Any]) -> "MarketInfo | None":
         """
+        缺 `id`、缺 `conditionId`、或取不到任何 token 时返回 None（调用方跳过这个 market）。
+
         例子:
-            MarketSnapshot.from_raws([{"id": "3215007", "clobTokenIds": '["a", "b"]'},
-                                      {"id": "3215008", "clobTokenIds": '["c", "d"]'}])
-            -> MarketSnapshot(raws=[...2 个 dict...],
-                              market_ids=["3215007", "3215008"],
-                              token_ids=["a", "b", "c", "d"])
+            MarketInfo.from_raw({"id": 3215007, "conditionId": "0x..", "clobTokenIds": '["a", "b"]',
+                                 "volume24hr": 1200.5, "closed": False, "acceptingOrders": True})
+            -> MarketInfo(id="3215007", tokens=("a", "b"), volume24hr=1200.5, is_trading=True, raw={...})
+            MarketInfo.from_raw({"id": "1"})  -> None
         """
+        mid = raw.get("id")
+        if mid is None or raw.get("conditionId") is None:
+            return None
+        tokens = tuple(token_ids_of(raw))
+        if not tokens:
+            return None
         return cls(
-            raws=raws,
-            market_ids=[str(r["id"]) for r in raws],
-            token_ids=[t for r in raws for t in token_ids_of(r)],
+            id=str(mid),
+            tokens=tokens,
+            volume24hr=_float_or_zero(raw.get("volume24hr")),
+            is_trading=not raw.get("closed") and bool(raw.get("acceptingOrders")),
+            raw=raw,
         )
 
 
@@ -141,14 +158,14 @@ class GammaClient:
     分三层，每层只做一件事:
         _request          发一次 HTTP 请求（带重试）
         _iter_markets     跟着 cursor 翻页，逐条给出 raw market
-        公开查询方法       决定"查什么、怎么筛"，只返回 raw dict
+        公开查询方法       决定"查什么、怎么筛"，返回 MarketInfo
 
-    raw dict 原样返回，不解析；它们会被原样写进 WAL，下游再解析。
+    MarketInfo.raw 是 Gamma 原样返回的 dict，会被原样写进 WAL，下游再解析。
 
     用法:
         async with GammaClient() as client:
-            raws = await client.top_markets_by_volume24h(n=50)
-        snap = MarketSnapshot.from_raws(raws)
+            markets = await client.top_markets_by_volume24h(n=50)
+        tokens = [t for m in markets for t in m.tokens]
     """
 
     # --- 生命周期 ----------------------------------------------------------
@@ -278,13 +295,13 @@ class GammaClient:
             if not page or not cursor:
                 return
 
-    # --- 公开查询：只返回 raw dict，不做 token 提取 ---------------------------
+    # --- 公开查询：返回 MarketInfo ------------------------------------------
 
     async def top_markets_by_volume24h(
         self,
         n: int | None = None,
         accepting_orders_only: bool = True,
-    ) -> list[dict[str, Any]]:
+    ) -> list[MarketInfo]:
         """
         按 24h 成交量从高到低取开放中的 market。
 
@@ -292,11 +309,10 @@ class GammaClient:
         - `n=N`    → 保留够 N 个就停
         - n <= 0   → 返回 []，不发请求
 
-        返回: list[dict]，raw market dict，按 volume24h 降序。
-        需要 market id / token id 时用 `MarketSnapshot.from_raws(...)`。
+        返回: list[MarketInfo]，按 volume24h 降序。
 
         筛选规则（都在客户端做）:
-        - 跳过缺 `id` 或 `conditionId` 的记录
+        - 跳过 `MarketInfo.from_raw` 返回 None 的记录（缺 `id` / `conditionId`，或没有 token）
         - `accepting_orders_only=True` 时跳过 `acceptingOrders` 不为真的。
           /markets/keyset 没有这个过滤参数（未知参数会被静默忽略）。
           已关闭的 market 由接口默认的 `closed=false` 排除。
@@ -307,39 +323,38 @@ class GammaClient:
 
         例子:
             await client.top_markets_by_volume24h(n=2)
-            -> [{"id": "3215007", "question": "Will there be no change in Fed ...?", ...},
-                {"id": "3215008", ...}]
+            -> [MarketInfo(id="3215007", tokens=("4286...", "8077..."), volume24hr=..., ...),
+                MarketInfo(id="3215008", ...)]
         """
         if n is not None and n <= 0:
             return []
 
         params: dict[str, Any] = {"order": "volume24hr", "ascending": "false"}
 
-        out: list[dict[str, Any]] = []
+        out: list[MarketInfo] = []
         seen_ids: set[str] = set()
         async for raw in self._iter_markets(params):
-            mid = raw.get("id")
-            if mid is None or raw.get("conditionId") is None:
+            m = MarketInfo.from_raw(raw)
+            if m is None:
                 continue
             if accepting_orders_only and not raw.get("acceptingOrders"):
                 continue
-            mid_s = str(mid)
-            if mid_s in seen_ids:
+            if m.id in seen_ids:
                 continue
-            seen_ids.add(mid_s)
+            seen_ids.add(m.id)
 
-            out.append(raw)
+            out.append(m)
             if n is not None and len(out) >= n:
                 break
         return out
 
-    async def markets_by_ids(self, ids: list[str]) -> dict[str, dict[str, Any]]:
+    async def markets_by_ids(self, ids: list[str]) -> dict[str, MarketInfo]:
         """
-        按 market id 查 raw 记录，开放和已关闭的都返回（`closed=any`）。
+        按 market id 查 market，开放和已关闭的都返回（`closed=any`）。
 
-        返回: dict[str, dict]，market id（str）-> raw dict。
-        只包含 Gamma 实际返回的 id；不存在 / 已删除的 id 不会出现，
-        和输入对比就能找出来。
+        返回: dict[str, MarketInfo]，market id（str）-> MarketInfo。
+        只包含 Gamma 实际返回、且 `MarketInfo.from_raw` 能解析的 id；
+        不存在 / 已删除的 id 不会出现，和输入对比就能找出来。
 
         - 输入里重复的 id 只查一次
         - 非纯数字的 id 跳过并记 warning：`id` 过滤会把每个值当 int 校验，
@@ -350,8 +365,8 @@ class GammaClient:
 
         例子:
             await client.markets_by_ids(["3215007", "3215007", "abc", "12", "999999999999"])
-            -> {"3215007": {"id": "3215007", "closed": False, ...},
-                "12":      {"id": "12", "closed": True, ...}}
+            -> {"3215007": MarketInfo(id="3215007", is_trading=True, ...),
+                "12":      MarketInfo(id="12", is_trading=False, ...)}
         """
         seen: set[str] = set()
         valid_ids: list[str] = []
@@ -365,13 +380,13 @@ class GammaClient:
                 continue
             valid_ids.append(s)
 
-        out: dict[str, dict[str, Any]] = {}
+        out: dict[str, MarketInfo] = {}
         for start in range(0, len(valid_ids), ID_BATCH_SIZE):
             batch = valid_ids[start:start + ID_BATCH_SIZE]
             async for raw in self._iter_markets({"id": batch, "closed": "any"}):
-                mid = raw.get("id")
-                if mid is not None:
-                    out[str(mid)] = raw
+                m = MarketInfo.from_raw(raw)
+                if m is not None:
+                    out[m.id] = m
         return out
 
 
@@ -380,15 +395,14 @@ class GammaClient:
 async def _main() -> None:
     """拉取全部开放 market，每个 raw dict 一行写到 <项目根>/data/active_markets.jsonl。"""
     async with GammaClient() as client:
-        raws = await client.top_markets_by_volume24h()
-    snap = MarketSnapshot.from_raws(raws)
-    print(f"all open markets by volume24hr: {len(snap.market_ids)} markets, "
-          f"{len(snap.token_ids)} token ids")
+        markets = await client.top_markets_by_volume24h()
+    print(f"all open markets by volume24hr: {len(markets)} markets, "
+          f"{sum(len(m.tokens) for m in markets)} token ids")
 
     out_path = Path(__file__).resolve().parents[2] / "data" / "active_markets.jsonl"
     with out_path.open("w", encoding="utf-8") as f:
-        for item in snap.raws:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        for m in markets:
+            f.write(json.dumps(m.raw, ensure_ascii=False) + "\n")
     print(f"wrote {out_path}")
 
 

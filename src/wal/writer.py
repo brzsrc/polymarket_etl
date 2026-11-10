@@ -1,12 +1,13 @@
 """
-Append-only WAL writer for raw WebSocket messages and Gamma snapshots (segment layout).
+Append-only WAL writer for raw WebSocket messages, Gamma snapshots and
+connection events (segment layout).
 
-Two streams, same layout and same lifecycle, under ``data_dir``::
+Three streams, same layout and same lifecycle, under ``data_dir``::
 
     wal/{YYYY-MM-DD}/000000.jsonl.gz       WS messages, sealed (immutable, gzip)
     wal/{YYYY-MM-DD}/000001.jsonl          WS messages, active
-    markets/{YYYY-MM-DD}/000000.jsonl.gz   Gamma snapshots, sealed
-    markets/{YYYY-MM-DD}/000001.jsonl      Gamma snapshots, active
+    markets/{YYYY-MM-DD}/000000.jsonl.gz   one line per market per discovery cycle
+    events/{YYYY-MM-DD}/000000.jsonl.gz    WS connection events (connect / disconnect / ...)
 
 Each (stream, date) has at most one active segment. The date is the UTC
 date of ``ts_recv_ns``. Every WS message is written once, with its full
@@ -65,21 +66,10 @@ from typing import IO, Self
 
 import msgspec
 
+from src import config
 from src.common.utilities import Rec
 
 logger = logging.getLogger(__name__)
-
-# fsync is expensive (1-10 ms), so it is batched: a crash loses at most this
-# many seconds of data. Same trade-off as Postgres.
-DEFAULT_FSYNC_INTERVAL_SEC = 1.0
-
-# Close the active segment once it reaches this size (uncompressed).
-# DEFAULT_SEGMENT_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
-DEFAULT_SEGMENT_MAX_BYTES = 50 * 1024 * 1024  # 50 MiB
-
-# How often the background loop checks segment sizes and retries pending
-# seals. At ~7 MB/s ingest a segment overshoots the limit by at most ~200 MB.
-DEFAULT_CHECK_INTERVAL_SEC = 30.0
 
 # Segment file names: 000123.jsonl (active or pending seal), 000123.jsonl.gz (sealed),
 # 000123.jsonl.gz.uploaded (left by the uploader after it deletes the .gz). The marker
@@ -93,7 +83,8 @@ _COPY_CHUNK = 1 << 20
 # Stream names double as directory names under data_dir.
 WAL = "wal"
 MARKETS = "markets"
-_STREAMS = (WAL, MARKETS)
+EVENTS = "events"
+_STREAMS = (WAL, MARKETS, EVENTS)
 
 # (stream, date), e.g. ("wal", "2026-11-08")
 _Key = tuple[str, str]
@@ -114,7 +105,8 @@ class Walwriter:
 
     Public methods:
         write(rec)                     record one WS message
-        write_market_snapshot(ts, raws) record one Gamma discovery cycle
+        write_market_snapshot(ts, recs) record one Gamma discovery cycle
+        write_event(ts, event)         record one WS connection event
         flush()                        fsync all dirty files now
         stats()                        counters for monitoring
         check_now() / wait_seals()     run one maintenance pass / wait for seals (tests)
@@ -125,9 +117,9 @@ class Walwriter:
     def __init__(
         self,
         data_dir: Path,
-        fsync_interval_sec: float = DEFAULT_FSYNC_INTERVAL_SEC,
-        segment_max_bytes: int | None = DEFAULT_SEGMENT_MAX_BYTES,
-        check_interval_sec: float = DEFAULT_CHECK_INTERVAL_SEC,
+        fsync_interval_sec: float = config.FSYNC_INTERVAL_SEC,
+        segment_max_bytes: int | None = config.SEGMENT_MAX_BYTES,
+        check_interval_sec: float = config.CHECK_INTERVAL_SEC,
         seal_on_exit: bool = True,
     ) -> None:
         if fsync_interval_sec <= 0:
@@ -173,6 +165,8 @@ class Walwriter:
         self._n_no_route = 0          # messages without asset_ids (still written)
         self._n_market_records = 0
         self._n_market_bytes = 0
+        self._n_events = 0
+        self._n_event_bytes = 0
         self._n_sealed = 0
         self._n_sealed_bytes = 0      # compressed bytes produced
         self._n_torn_bytes = 0        # torn trailing bytes dropped while sealing
@@ -234,9 +228,9 @@ class Walwriter:
 
         logger.info(
             "WAL writer stopped (msgs=%d, bytes=%d, no_route=%d, sealed=%d, "
-            "market_records=%d, market_bytes=%d)",
+            "market_records=%d, market_bytes=%d, events=%d)",
             self._n_messages, self._n_bytes, self._n_no_route, self._n_sealed,
-            self._n_market_records, self._n_market_bytes,
+            self._n_market_records, self._n_market_bytes, self._n_events,
         )
 
     # ------------------------------------------------------------------
@@ -273,29 +267,46 @@ class Walwriter:
             if not rec.asset_ids:
                 self._n_no_route += 1
 
-    async def write_market_snapshot(self, ts_recv_ns: int, raws: list[dict]) -> None:
+    async def write_market_snapshot(self, ts_recv_ns: int, records: list[dict]) -> None:
         """
-        Persist one Gamma discovery cycle: every raw market dict, one per line.
+        Persist one Gamma discovery cycle: one line per record.
 
         Stored in its own stream, ``{data_dir}/markets/{date}/NNNNNN.jsonl``,
         because the records have a different shape (Gamma dicts, not WS text).
         Rotation and sealing work exactly as for the WS stream.
 
-        Each line: ``{"ts_recv_ns": <int>, "raw": <market dict>}``. The
-        timestamp is shared by all records of a cycle so downstream code can
-        group "what Gamma said at moment T".
+        Each line is ``{"ts_recv_ns": <int>, **record}``. The writer does not
+        look inside ``record``; the orchestrator writes
+        ``{"market_id", "source", "rank", "sub": {...}, "raw": <Gamma dict>}``.
+        The timestamp is shared by all records of a cycle so downstream code
+        can group "what Gamma said, and what we did, at moment T".
         """
-        if not raws:
+        if not records:
             return
         date_str = self._date_str_from_ns(ts_recv_ns)
         lines = b"".join(
-            self._encoder.encode({"ts_recv_ns": ts_recv_ns, "raw": r}) + b"\n"
-            for r in raws
+            self._encoder.encode({"ts_recv_ns": ts_recv_ns, **r}) + b"\n"
+            for r in records
         )
         async with self._lock:
             self._append_locked((MARKETS, date_str), lines)
-            self._n_market_records += len(raws)
+            self._n_market_records += len(records)
             self._n_market_bytes += len(lines)
+
+    async def write_event(self, ts_ns: int, event: dict) -> None:
+        """
+        Persist one WS connection event to ``{data_dir}/events/{date}/NNNNNN.jsonl``.
+
+        Each line is ``{"ts_ns": <int>, **event}``; the orchestrator writes
+        ``{"conn_id", "event", "extra"}``. Events are rare (connect,
+        disconnect, ...), so this is not on the hot path.
+        """
+        date_str = self._date_str_from_ns(ts_ns)
+        line = self._encoder.encode({"ts_ns": ts_ns, **event}) + b"\n"
+        async with self._lock:
+            self._append_locked((EVENTS, date_str), line)
+            self._n_events += 1
+            self._n_event_bytes += len(line)
 
     async def flush(self) -> None:
         """fsync every dirty file now."""
@@ -511,6 +522,8 @@ class Walwriter:
             "no_route": self._n_no_route,
             "market_records": self._n_market_records,
             "market_bytes": self._n_market_bytes,
+            "events": self._n_events,
+            "event_bytes": self._n_event_bytes,
             "sealed": self._n_sealed,
             "sealed_bytes": self._n_sealed_bytes,
             "torn_bytes": self._n_torn_bytes,

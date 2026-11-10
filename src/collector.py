@@ -5,15 +5,23 @@ length and a clean shutdown.
 
 Command line (local end-to-end run, any directory as the destination)::
 
-    python -m src.collector --data-dir /tmp/pm --landing /tmp/fake_volume \\
-        --n-markets 20 --duration-sec 600 --segment-max-mb 5
+    python -m src.collector --data-dir /tmp/pm --landing /tmp/fake_volume --duration-sec 600
+
+Local collector uploading straight to ADLS Gen2 (auth: DefaultAzureCredential,
+e.g. AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET)::
+
+    python -m src.collector --data-dir ~/polymarket_data \\
+        --landing abfss://landing@myaccount.dfs.core.windows.net/polymarket
+
+Tunables (markets per cycle, subscription cap, segment size, ...) come from
+``src/config.py``; the command line only says where to run and for how long.
 
 Databricks notebook (the notebook already runs an event loop, so await)::
 
     from src.collector import run
     stats = await run(data_dir="/tmp/polymarket",
                       landing="/Volumes/polymarket/raw/landing",
-                      host_id="dbx", n_markets=200, duration_sec=4 * 3600)
+                      host_id="dbx", duration_sec=4 * 3600)
 
 Shutdown order matters and is fixed by the nesting below:
 
@@ -37,29 +45,51 @@ import re
 import signal
 import socket
 import sys
+from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 
-from src.orchestrator import TOP_N_MARKETS, Orchestrator
-from src.wal.uploader import DEFAULT_SCAN_INTERVAL_SEC, Uploader, put_file
-from src.wal.writer import DEFAULT_CHECK_INTERVAL_SEC, DEFAULT_SEGMENT_MAX_BYTES, Walwriter
+from src import config
+from src.orchestrator import Orchestrator
+from src.wal.uploader import PutFn, Uploader, put_file
+from src.wal.writer import Walwriter
 
 logger = logging.getLogger(__name__)
 
-# Orchestrator writes these into data_dir; uploaded under _runs/ on exit.
-_RUN_LOGS = ("metrics.jsonl", "events.jsonl")
+# Orchestrator writes this into data_dir; uploaded under _runs/ on exit.
+# (Connection events go to the WAL's events stream, uploaded continuously.)
+_RUN_LOGS = ("metrics.jsonl",)
+
+ADLS_SCHEME = "abfss://"
+
+
+def make_put(landing: str | Path, data_dir: Path) -> tuple[PutFn, Callable[[], None]]:
+    """
+    Pick the upload function for ``landing``. Returns (put, close).
+
+    - ``abfss://<container>@<account>.dfs.core.windows.net[/<folder>]``
+      -> ``AdlsPut`` (ADLS Gen2, staging + atomic rename)
+    - anything else -> a directory (UC volume path or local dir), ``put_file``
+
+    ``src.wal.adls`` (and the azure SDK) is imported only for ADLS, so the
+    Databricks notebook runs without the azure packages.
+    """
+    if str(landing).startswith(ADLS_SCHEME):
+        from src.wal.adls import AdlsPut
+        put = AdlsPut(str(landing))
+        return put, put.close
+    dest = Path(landing)
+    if data_dir.resolve() == dest.resolve():
+        raise ValueError("data_dir and landing must be different directories")
+    return partial(put_file, dest_root=dest), (lambda: None)
 
 
 async def run(
     data_dir: Path | str,
-    landing: Path | str,
+    landing: str | Path,
     *,
     host_id: str | None = None,
-    n_markets: int = TOP_N_MARKETS,
     duration_sec: float | None = None,
-    segment_max_bytes: int | None = DEFAULT_SEGMENT_MAX_BYTES,
-    check_interval_sec: float = DEFAULT_CHECK_INTERVAL_SEC,
-    scan_interval_sec: float = DEFAULT_SCAN_INTERVAL_SEC,
     keep_local: bool = False,
     stop_event: asyncio.Event | None = None,
     handle_signals: bool = False,
@@ -73,35 +103,50 @@ async def run(
 
     data_dir:  local working dir for the WAL (must support appends:
                local disk, not /Volumes).
-    landing:   destination root: a UC volume path on Databricks, or any
-               directory for local runs.
+    landing:   destination root: a UC volume path on Databricks, any
+               directory for local runs, or an abfss:// URL to upload to
+               ADLS Gen2 (see make_put).
     handle_signals: turn SIGTERM / SIGINT into a clean stop. Leave False in
                notebooks, where the kernel owns SIGINT.
+
+    All tunables (markets per cycle, subscription cap, segment size, ...)
+    come from ``src/config.py``. They are read here, at call time, and passed
+    down explicitly, so changing ``config.X`` before calling run() takes
+    effect (the components' own defaults are fixed at import time).
     """
     data_dir = Path(data_dir)
-    landing = Path(landing)
-    if data_dir.resolve() == landing.resolve():
-        raise ValueError("data_dir and landing must be different directories")
+    # Before anything starts, so a bad landing fails fast. Kept as given (not
+    # Path()): Path would collapse the "//" of an abfss:// URL.
+    put, close_put = make_put(landing, data_dir)
     host_id = host_id or default_host_id()
     stop = stop_event or asyncio.Event()
-    put = partial(put_file, dest_root=landing)
 
     remove_handlers = _install_signal_handlers(stop) if handle_signals else (lambda: None)
     try:
         async with Uploader(
             data_dir, put, host_id,
-            scan_interval_sec=scan_interval_sec, keep_local=keep_local,
+            keep_local=keep_local,
+            scan_interval_sec=config.UPLOAD_SCAN_INTERVAL_SEC,
+            exit_timeout_sec=config.UPLOAD_EXIT_TIMEOUT_SEC,
         ) as up:
             async with Walwriter(
                 data_dir,
-                segment_max_bytes=segment_max_bytes,
-                check_interval_sec=check_interval_sec,
+                segment_max_bytes=config.SEGMENT_MAX_BYTES,
+                fsync_interval_sec=config.FSYNC_INTERVAL_SEC,
+                check_interval_sec=config.CHECK_INTERVAL_SEC,
             ) as wal:
-                orch = Orchestrator(out_dir=data_dir, wal=wal, n_markets=n_markets)
+                orch = Orchestrator(
+                    out_dir=data_dir, wal=wal,
+                    n_markets=config.TOP_N_MARKETS,
+                    max_subscribed_markets=config.MAX_SUBSCRIBED_MARKETS,
+                    interval_sec=config.DISCOVERY_INTERVAL_SEC,
+                    missing_strikes_to_remove=config.MISSING_STRIKES_TO_REMOVE,
+                )
                 await orch.start()
                 logger.info(
-                    "collector running (data_dir=%s, landing=%s, n_markets=%d, duration=%s)",
-                    data_dir, landing, n_markets,
+                    "collector running (data_dir=%s, landing=%s, n_markets=%d, "
+                    "max_subscribed_markets=%d, duration=%s)",
+                    data_dir, landing, config.TOP_N_MARKETS, config.MAX_SUBSCRIBED_MARKETS,
                     f"{duration_sec:.0f}s" if duration_sec is not None else "unlimited",
                 )
                 try:
@@ -114,6 +159,7 @@ async def run(
         result = {"wal": wal.stats(), "uploader": up.stats()}
     finally:
         remove_handlers()
+        close_put()
 
     logger.info("collector finished: %s", result)
     return result
@@ -142,7 +188,7 @@ async def _wait_for_stop(stop: asyncio.Event, duration_sec: float | None) -> Non
 
 
 async def _upload_run_logs(data_dir: Path, put, source_id: str) -> None:
-    """Copy metrics/events logs to _runs/{source_id}/. Failure is logged, not raised."""
+    """Copy the run logs (metrics) to _runs/{source_id}/. Failure is logged, not raised."""
     for name in _RUN_LOGS:
         p = data_dir / name
         if not p.exists():
@@ -185,15 +231,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run the Polymarket collector.")
     p.add_argument("--data-dir", required=True, type=Path,
                    help="local WAL directory (local disk, not /Volumes)")
-    p.add_argument("--landing", required=True, type=Path,
-                   help="destination root: /Volumes/<catalog>/<schema>/<volume> or any directory")
+    p.add_argument("--landing", required=True,
+                   help="destination root: /Volumes/<catalog>/<schema>/<volume>, any directory, "
+                        "or abfss://<container>@<account>.dfs.core.windows.net/<folder> (ADLS Gen2)")
     p.add_argument("--host-id", default=None,
                    help="prefix of the source id in remote file names (default: hostname)")
-    p.add_argument("--n-markets", type=int, default=TOP_N_MARKETS)
     p.add_argument("--duration-sec", type=float, default=None,
                    help="stop after this many seconds (default: run until SIGTERM/SIGINT)")
-    p.add_argument("--segment-max-mb", type=float, default=None,
-                   help="seal a segment at this size (default: writer default)")
     p.add_argument("--keep-local", action="store_true",
                    help="keep local .gz files after upload")
     p.add_argument("--log-level", default="INFO")
@@ -206,15 +250,10 @@ def main(argv: list[str] | None = None) -> int:
         level=args.log_level.upper(),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    segment_max = (
-        int(args.segment_max_mb * 1024 * 1024) if args.segment_max_mb else DEFAULT_SEGMENT_MAX_BYTES
-    )
     stats = asyncio.run(run(
         args.data_dir, args.landing,
         host_id=args.host_id,
-        n_markets=args.n_markets,
         duration_sec=args.duration_sec,
-        segment_max_bytes=segment_max,
         keep_local=args.keep_local,
         handle_signals=True,
     ))

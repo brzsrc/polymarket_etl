@@ -2,3 +2,6 @@
 msgspec
 websockets>=13   # src/ws/connection.py uses websockets.asyncio.client (added in 13)
 httpx            # src/market/gamma_client.py
+# Only for uploading to ADLS (--landing abfss://...): src/wal/adls.py
+azure-storage-file-datalake>=12.26
+azure-identity>=1.27

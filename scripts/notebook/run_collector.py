@@ -8,8 +8,9 @@
 # MAGIC 本地临时盘 /tmp/polymarket/                       landing volume（/Volumes/...）
 # MAGIC   wal/{date}/NNNNNN.jsonl      ← 正在写
 # MAGIC   wal/{date}/NNNNNN.jsonl.gz   ← 封存好 ──上传──▶  ws/{date}/{source_id}-{date}-NNNNNN.jsonl.gz
-# MAGIC   markets/{date}/...                     ──上传──▶  markets/{date}/...
-# MAGIC   metrics.jsonl, events.jsonl            ──退出时─▶  _runs/{source_id}/
+# MAGIC   markets/{date}/...                     ──上传──▶  markets/{date}/...   每轮每个市场一行（含订阅决定）
+# MAGIC   events/{date}/...                      ──上传──▶  events/{date}/...    WS 连接事件（断线、重连）
+# MAGIC   metrics.jsonl                          ──退出时─▶  _runs/{source_id}/
 # MAGIC ```
 # MAGIC
 # MAGIC - WAL 必须写在本地盘：`/Volumes` 不支持追加写。
@@ -32,20 +33,14 @@
 
 dbutils.widgets.text("landing", "/Volumes/polymarket/raw/landing")
 dbutils.widgets.text("duration_sec", "1800")
-dbutils.widgets.text("n_markets", "50")
-dbutils.widgets.text("segment_max_mb", "50")
 dbutils.widgets.text("host_id", "dbx")
 
 LANDING = dbutils.widgets.get("landing").rstrip("/")
 DURATION_SEC = float(dbutils.widgets.get("duration_sec"))
-N_MARKETS = int(dbutils.widgets.get("n_markets"))
-SEGMENT_MAX_BYTES = int(float(dbutils.widgets.get("segment_max_mb")) * 1024 * 1024)
 HOST_ID = dbutils.widgets.get("host_id")
 
 print(f"landing     = {LANDING}")
 print(f"duration    = {DURATION_SEC:.0f}s")
-print(f"n_markets   = {N_MARKETS}")
-print(f"segment_max = {SEGMENT_MAX_BYTES / 1024 / 1024:.0f} MiB")
 
 # COMMAND ----------
 
@@ -95,15 +90,21 @@ print(f"data_dir    = {DATA_DIR}")
 
 # COMMAND ----------
 
+from src import config
 from src.collector import run
+
+# 可调参数（每轮取多少个市场、订阅上限、segment 大小等）都来自 src/config.py。
+# 打印出来，Job 日志里能看到这次是按什么参数跑的。
+print(f"n_markets   = {config.TOP_N_MARKETS}")
+print(f"max_subs    = {config.MAX_SUBSCRIBED_MARKETS}")
+print(f"interval    = {config.DISCOVERY_INTERVAL_SEC:.0f}s")
+print(f"segment_max = {config.SEGMENT_MAX_BYTES / 1024 / 1024:.0f} MiB")
 
 stats = await run(
     data_dir=DATA_DIR,
     landing=LANDING,
     host_id=HOST_ID,
-    n_markets=N_MARKETS,
     duration_sec=DURATION_SEC,
-    segment_max_bytes=SEGMENT_MAX_BYTES,
 )
 stats
 
@@ -118,13 +119,14 @@ wal_stats, up_stats = stats["wal"], stats["uploader"]
 print(f"source_id      = {up_stats['source_id']}")
 print(f"messages       = {wal_stats['messages']}")
 print(f"market records = {wal_stats['market_records']}")
+print(f"events         = {wal_stats['events']}")
 print(f"sealed         = {wal_stats['sealed']}")
 print(f"uploaded       = {up_stats['uploaded']}  ({up_stats['uploaded_bytes'] / 1e6:.1f} MB)")
 print(f"failures       = {up_stats['failures']}  last_error={up_stats['last_error']}")
 
 # This run's files at the destination
 sid = up_stats["source_id"]
-for stream in ("ws", "markets"):
+for stream in ("ws", "markets", "events"):
     files = sorted(Path(LANDING, stream).glob(f"*/{sid}-*.jsonl.gz"))
     print(f"{stream}: {len(files)} files")
     for f in files[-5:]:

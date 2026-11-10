@@ -69,8 +69,10 @@ class ConnectionEvent(str, Enum):
     """Lifecycle events the pool / metrics layer wants to observe."""
     # in connected state
     CONNECTED = "connected"
-    # msg just sent to ws
+    # subscribe msg just sent to ws (initial on connect, or incremental)
     SUBSCRIBED = "subscribed"
+    # incremental unsubscribe msg just sent to ws
+    UNSUBSCRIBED = "unsubscribed"
     # disconnected which gonna cause retrying
     DISCONNECTED = "disconnected"
     # reconnecting
@@ -219,13 +221,19 @@ class WSConnection:
         message when we (re)connect.
 
         Idempotent: re-adding an existing asset_id is a no-op.
+
+        Emits SUBSCRIBED (``operation="subscribe"``, the new assets) when the
+        incremental message was actually sent. If not connected, nothing is
+        emitted: the assets show up in the next connect's SUBSCRIBED event.
         """
+        sent = False
         async with self._sub_lock:
             # Filter to only-new ones to avoid sending duplicate sub messages
             new_ones = [a for a in asset_ids if a not in self._subscriptions]
             if not new_ones:
                 return
             self._subscriptions.update(new_ones)
+            total = len(self._subscriptions)
 
             if self._ws is not None and not self._ws.close_code:
                 # Send incremental subscribe. Polymarket distinguishes:
@@ -242,9 +250,17 @@ class WSConnection:
                 }
                 try:
                     await self._ws.send(msgspec.json.encode(msg).decode())
+                    sent = True
                 except ConnectionClosed:
                     # Will be re-sent in the next reconnect's full subscribe.
                     logger.debug("conn %d: incremental subscribe lost (closed)", self._conn_id)
+
+        # Outside the lock: the handler writes to the WAL.
+        if sent:
+            await self._emit_event(
+                ConnectionEvent.SUBSCRIBED,
+                {"operation": "subscribe", "assets": new_ones, "asset_count": total},
+            )
 
     async def remove_subscriptions(self, asset_ids: list[str]) -> None:
         """
@@ -253,22 +269,33 @@ class WSConnection:
         Note: Polymarket's WS does not reliably honor unsubscribe — see the
         live test in scripts/. We send the unsubscribe message anyway (no
         harm) and remove from our tracking. If the server keeps sending data
-        for unsubscribed assets, the pool will drop those messages by the
-        asset_id NOT being in any connection's set anymore.
+        for unsubscribed assets, they are still forwarded and written to the
+        WAL (the pool does not filter).
+
+        Emits UNSUBSCRIBED (the removed assets) when the message was sent.
         """
+        sent = False
         async with self._sub_lock:
             removed = [a for a in asset_ids if a in self._subscriptions]
             if not removed:
                 return
             self._subscriptions.difference_update(removed)
+            total = len(self._subscriptions)
 
             if self._ws is not None and not self._ws.close_code:
                 msg = {"assets_ids": removed, "operation": "unsubscribe"}
                 try:
                     await self._ws.send(msgspec.json.encode(msg).decode())
+                    sent = True
                 except ConnectionClosed:
                     logger.debug("conn %d: remove subscribe lost (closed)", self._conn_id)
                     pass  # we're not subscribed anymore anyway
+
+        if sent:
+            await self._emit_event(
+                ConnectionEvent.UNSUBSCRIBED,
+                {"assets": removed, "asset_count": total},
+            )
 
 
     async def run(self, custom_feature_enabled: bool=False) -> None:
@@ -318,13 +345,19 @@ class WSConnection:
                     self._ws = ws
                     self._last_data_msg_ts = asyncio.get_event_loop().time()
 
-                    await self._emit_event(ConnectionEvent.CONNECTED, {})
-
                     # Send initial subscription. If subscriptions is empty
                     # (rare; pool creates a connection slightly before
                     # adding), we still need to send something — empty list.
                     async with self._sub_lock:
                         initial_subs = list(self._subscriptions)
+
+                    # Full asset list on both events: after a disconnect,
+                    # downstream needs to know which assets this connection
+                    # carried (= which order books have a gap).
+                    await self._emit_event(
+                        ConnectionEvent.CONNECTED,
+                        {"assets": initial_subs, "asset_count": len(initial_subs)},
+                    )
 
                     init_msg = {
                         "type": "market",
@@ -337,7 +370,8 @@ class WSConnection:
                     await ws.send(msgspec.json.encode(init_msg).decode())
                     await self._emit_event(
                         ConnectionEvent.SUBSCRIBED,
-                        {"asset_count": len(initial_subs)},
+                        {"operation": "initial", "assets": initial_subs,
+                         "asset_count": len(initial_subs)},
                     )
 
                     # Spawn ping + watchdog + receive tasks.

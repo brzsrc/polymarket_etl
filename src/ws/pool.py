@@ -39,6 +39,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from src import config
 from src.common.utilities import Rec
 
 from .connection import (
@@ -51,11 +52,6 @@ from .connection import (
 
 logger = logging.getLogger(__name__)
 
-# Polymarket cap is 500/connection. We use 200 to:
-# - leave 60% headroom for protocol-level overhead variance
-# - stay below ~250 where some users have reported zombie-connection issues
-# - match nautilus_trader's tested default
-DEFAULT_MAX_PER_CONNECTION = 200
 
 class WSPool:
     """
@@ -77,7 +73,7 @@ class WSPool:
         self,
         on_message: MessageHandler,
         on_event: EventHandler | None = None,
-        max_per_connection: int = DEFAULT_MAX_PER_CONNECTION,
+        max_per_connection: int = config.MAX_PER_CONNECTION,
     ) -> None:
         if max_per_connection <= 0 or max_per_connection > 500:
             raise ValueError("max_per_connection must be in (0, 500]")
