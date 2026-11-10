@@ -3,3 +3,5 @@ __pycache__/
 data/
 .DS_Store
 .venv/
+deploy/
+src/config.py

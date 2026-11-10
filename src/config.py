@@ -31,7 +31,8 @@ MAX_PER_CONNECTION = 200
 # --- WAL writer（src/wal/writer.py）----------------------------------------
 
 # 活动 segment 达到这个大小（未压缩）就关闭、封存。
-SEGMENT_MAX_BYTES = 50 * 1024 * 1024  # 50 MiB
+# SEGMENT_MAX_BYTES = 50 * 1024 * 1024  # 50 MiB
+SEGMENT_MAX_BYTES = 1024 * 1024 * 1024  # 1 GiB
 
 # fsync 很贵（1-10 ms），所以批量做：崩溃时最多丢这么多秒的数据。
 FSYNC_INTERVAL_SEC = 1.0
@@ -39,6 +40,10 @@ FSYNC_INTERVAL_SEC = 1.0
 # 后台多久检查一次 segment 大小、重试失败的封存。
 # 按 ~7 MB/s 的写入速度，一个 segment 最多超出上限约 200 MB。
 CHECK_INTERVAL_SEC = 30.0
+
+# UTC 零点过后再等这么多秒，才关闭并封存前一天的 segment，
+# 让零点前收到、还在队列里的消息先写进去。之后再迟到的写入会开一个新段号。
+DAY_CLOSE_GRACE_SEC = 60.0
 
 # --- uploader（src/wal/uploader.py）----------------------------------------
 
