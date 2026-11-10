@@ -1,0 +1,38 @@
+# Run the collector on the VM.
+#
+# Setup (once):
+#   mkdir -p ~/polymarket/data && cd ~/polymarket
+#   copy this file to ~/polymarket/compose.yml and .env.example to ~/polymarket/.env
+#
+# Use (always from ~/polymarket):
+#   docker compose pull && docker compose up -d     start / update to the newest image
+#   docker compose logs -f --tail 50                follow the logs
+#   TAG=<commit sha> docker compose up -d           roll back to an older image
+#   docker compose stop                             stop (seals and uploads first)
+
+services:
+  collector:
+    image: ghcr.io/brzsrc/polymarket_etl:${TAG:-latest}
+    command:
+      - --data-dir
+      - /data
+      - --landing
+      - ${LANDING:?set LANDING in .env}
+      - --host-id
+      - ${HOST_ID:-vm1}
+    volumes:
+      # WAL, sealed files waiting for upload and .source_id live on the VM's
+      # disk, so they survive a container replacement.
+      - ./data:/data
+    # Small init process as PID 1: forwards SIGTERM to Python even before
+    # Python has installed its own handler.
+    init: true
+    restart: unless-stopped
+    # On stop the collector seals and uploads (up to UPLOAD_EXIT_TIMEOUT_SEC =
+    # 300 s). Docker's default is 10 s, then SIGKILL, which would skip that.
+    stop_grace_period: 6m
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
