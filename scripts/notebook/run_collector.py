@@ -18,7 +18,7 @@
 # MAGIC   **Job 的超时时间必须比 `duration_sec` 长**（建议多 30 分钟），否则被强制终止时来不及收尾。
 # MAGIC - 运行环境：Serverless，environment version 2 或更高（代码需要 Python 3.11+）。
 # MAGIC
-# MAGIC 跑完后接着运行 `bronze_ingest`，把 `ws/` 导入 `bronze.ws_raw`。
+# MAGIC 跑完后接着运行 `src/ingestor/bronze`（notebook），把 landing 里的文件导入 bronze 表。
 
 # COMMAND ----------
 

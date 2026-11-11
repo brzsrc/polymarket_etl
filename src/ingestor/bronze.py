@@ -1,11 +1,22 @@
-"""
-Bronze ingestion：landing 里的 WAL 文件 → bronze Delta 表（Auto Loader）。
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Bronze ingestion
+# MAGIC
+# MAGIC landing volume 里的 WAL 文件 → bronze Delta 表（Auto Loader，`availableNow`：把还没导入的文件处理完就结束）。
+# MAGIC
+# MAGIC | landing 目录 | bronze 表 |
+# MAGIC |---|---|
+# MAGIC | `ws/` | `bronze.ws_raw` |
+# MAGIC | `markets/` | `bronze.markets_raw` |
+# MAGIC | `events/` | `bronze.events_raw` |
+# MAGIC | `metrics/` | `bronze.metrics_raw`（`INCLUDE_METRICS = True` 时） |
+# MAGIC
+# MAGIC - 在 `scripts/notebook/run_collector` 之后运行。重跑不会重复导入：每张表的 checkpoint 记着哪些文件已经导入过。
+# MAGIC - 这个文件**同时是普通 Python 模块**：本地 `python -m src.ingestor.bronze` 也能跑，
+# MAGIC   `tests/ingestor/test_bronze.py` import 它做测试。import 不会建表、也不会启动流；只有 `main()` 才会（最后一个 cell）。
+# MAGIC - 所以这里**不要用 `dbutils`、`display()`、`%pip`**：本地没有这些，import 会失败。配置改下面的常量。
 
-运行:  python -m src.ingestor.bronze
-import 这个模块不会建表、也不会启动流；只有 main() 才会。
-"""
-
-from __future__ import annotations
+# COMMAND ----------
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -33,10 +44,12 @@ TABLE_COMMENT = {
     "metrics_raw": "采集端每秒监控快照，只用于监控",
 }
 
+# COMMAND ----------
 
-# =============================================================================
-# 表结构（DDL）
-# =============================================================================
+# MAGIC %md
+# MAGIC ## 表结构（DDL）
+
+# COMMAND ----------
 
 # 四张表共用的来源列
 SOURCE_COLS_DDL = """
@@ -99,10 +112,12 @@ DDL = {
     {SOURCE_COLS_DDL}""",
 }
 
+# COMMAND ----------
 
-# =============================================================================
-# WAL 文件的读取 schema
-# =============================================================================
+# MAGIC %md
+# MAGIC ## WAL 文件的读取 schema
+
+# COMMAND ----------
 
 SCHEMAS = {
     "ws_raw": StructType([
@@ -173,10 +188,14 @@ CORE_NOT_NULL = {
     "metrics_raw": "ts_ns IS NULL",
 }
 
+# COMMAND ----------
 
-# =============================================================================
-# 纯函数：不碰 Spark session，可以直接 import 来测试
-# =============================================================================
+# MAGIC %md
+# MAGIC ## 纯函数
+# MAGIC
+# MAGIC 不碰 Spark session，可以直接 import 来测试。
+
+# COMMAND ----------
 
 def fq(table: str) -> str:
     """fully qualified 表名：catalog.schema.table，例如 polymarket.bronze.ws_raw"""
@@ -197,10 +216,12 @@ def path_re(table_dir: str) -> str:
     # {dir}/{date}/{source_id}-{date}-{NNNNNN}.jsonl.gz   ->   1 = date, 2 = source_id, 3 = segment number
     return rf"/{table_dir}/(\d{{4}}-\d{{2}}-\d{{2}})/([A-Za-z0-9_-]+)-\d{{4}}-\d{{2}}-\d{{2}}-(\d{{6}})\.jsonl\.gz$"
 
+# COMMAND ----------
 
-# =============================================================================
-# Spark 步骤
-# =============================================================================
+# MAGIC %md
+# MAGIC ## Spark 步骤
+
+# COMMAND ----------
 
 def get_spark() -> SparkSession:
     spark = SparkSession.getActiveSession()
@@ -299,7 +320,9 @@ def wait_all(queries: dict[str, StreamingQuery]) -> None:
             failures[t] = e
             print(f"{t:12s} FAILED: {e}")
             continue
-        rows = sum(p["numInputRows"] for p in q.recentProgress)
+        # 没处理任何 batch 的进度事件（例如 availableNow 下没有新文件）里
+        # numInputRows 可能是 None，按 0 算。
+        rows = sum(p["numInputRows"] or 0 for p in q.recentProgress)
         print(f"{t:12s} rows={rows}")
 
     if failures:
@@ -348,6 +371,16 @@ def main() -> None:
     wait_all(start_streams(spark))
     show_checks(spark)
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 运行
+# MAGIC
+# MAGIC 建表 → 四个流一起跑到处理完 → 打印检查结果。任何一个流失败，这个 cell 都会失败（Job 也会失败）。
+# MAGIC
+# MAGIC 在 notebook 里 `__name__ == "__main__"`，所以 Run all 会执行 `main()`；本地被 import 时不会执行。
+
+# COMMAND ----------
 
 if __name__ == "__main__":
     main()

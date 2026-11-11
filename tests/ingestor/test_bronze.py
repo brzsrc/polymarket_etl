@@ -32,7 +32,7 @@ from src.ingestor import bronze as b  # noqa: E402
 from src.wal.uploader import Uploader, put_file  # noqa: E402
 from src.wal.writer import Walwriter  # noqa: E402
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def ns(iso: str) -> int:

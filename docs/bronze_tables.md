@@ -1,6 +1,6 @@
 # Bronze 层：表说明和字段
 
-由 [scripts/notebook/bronze_ingest.py](../scripts/notebook/bronze_ingest.py) 生成。WS 原始消息里每个字段的含义（`raw` 里面有什么）见 [data_fields.md](data_fields.md)。
+由 [src/ingestor/bronze.py](../src/ingestor/bronze.py) 生成（这个文件同时是 Databricks notebook）。WS 原始消息里每个字段的含义（`raw` 里面有什么）见 [data_fields.md](data_fields.md)。
 
 ## 1. 作用和原则
 
