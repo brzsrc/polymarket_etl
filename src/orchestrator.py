@@ -113,9 +113,6 @@ class _Metrics:
         self.msgs_per_conn: dict[int, int] = defaultdict(int)
         self.errors_per_conn: dict[int, int] = defaultdict(int)
 
-        # Asset coverage (assets that have produced at least one msg)
-        self.assets_seen: set[str] = set()
-
         # Error counters
         self.json_decode_failures = 0
         self.missing_timestamp = 0
@@ -142,8 +139,6 @@ class _Metrics:
         self.bytes_total += len(rec.raw)
         self.callback_ns_total += callback_ns
         self.msgs_per_conn[conn_id] += 1
-        for aid in rec.asset_ids:
-            self.assets_seen.add(aid)
 
         # Latency only meaningful for dict messages with 'timestamp'.
         # The initial-subscribe response is a *list* of book snapshots
@@ -183,8 +178,11 @@ class _Metrics:
 
     # --- snapshot ---
 
-    def snapshot(self, t_ns: int) -> dict:
-        """Per-second snapshot. Computes deltas vs. previous snapshot."""
+    def snapshot(self, t_ns: int, subscribed_markets: int, subscribed_tokens: int) -> dict:
+        """
+        Per-second snapshot. Computes deltas vs. previous snapshot.
+        The subscription counts are owned by the orchestrator and passed in.
+        """
         elapsed_s = (t_ns - self.t_start_ns) / 1e9
         d_msgs = self.msgs_total - self._prev_msgs
         d_bytes = self.bytes_total - self._prev_bytes
@@ -198,7 +196,8 @@ class _Metrics:
             "msgs_total": self.msgs_total,
             "msgs_per_sec_window": d_msgs,
             "bytes_per_sec_window": d_bytes,
-            "assets_seen": len(self.assets_seen),
+            "subscribed_markets": subscribed_markets,
+            "subscribed_tokens": subscribed_tokens,
             "lat_window_ms": lat_stats,
             "errors": {
                 "json_decode": self.json_decode_failures,
@@ -389,7 +388,11 @@ class Orchestrator:
         while True:
             await asyncio.sleep(METRICS_SAMPLE_INTERVAL_SEC)
             ts = now_ns()
-            snap = self._metrics.snapshot(ts)
+            snap = self._metrics.snapshot(
+                ts,
+                subscribed_markets=len(self._subs),
+                subscribed_tokens=sum(len(s.info.tokens) for s in self._subs.values()),
+            )
             try:
                 await self._wal.write_metrics(ts, snap)
             except Exception:
@@ -397,9 +400,9 @@ class Orchestrator:
                 logger.exception("write_metrics failed")
             lat = snap["lat_window_ms"]
             logger.info(
-                "metrics t=%5.1fs msgs+%4d/s assets=%d lat n=%d med=%s p95=%s err(d/r/w)=%d/%d/%d",
+                "metrics t=%5.1fs msgs+%4d/s subs=%d/%d lat n=%d med=%s p95=%s err(d/r/w)=%d/%d/%d",
                 snap["t_rel_s"], snap["msgs_per_sec_window"],
-                snap["assets_seen"],
+                snap["subscribed_markets"], snap["subscribed_tokens"],
                 lat.get("n", 0), lat.get("median", "-"), lat.get("p95", "-"),
                 snap["errors"]["disconnects"],
                 snap["errors"]["reconnects"],

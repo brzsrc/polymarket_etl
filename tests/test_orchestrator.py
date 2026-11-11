@@ -331,3 +331,37 @@ def test_sampler_writes_metrics_to_wal_and_survives_errors(tmp_path, monkeypatch
     ts, sample = wal.metrics[-1]
     assert ts > 0 and "msgs_total" in sample and "errors" in sample
     assert [t for t, _ in wal.metrics] == sorted(t for t, _ in wal.metrics)
+
+
+def test_metrics_report_current_subscriptions(tmp_path, gamma, monkeypatch, caplog):
+    monkeypatch.setattr(orchestrator, "METRICS_SAMPLE_INTERVAL_SEC", 0.01)
+    orch, _, wal = make_orch(tmp_path, n_markets=2, max_subscribed_markets=2)
+
+    async def sample_once():
+        n = len(wal.metrics)
+        task = asyncio.create_task(orch._sampler_loop())
+        while len(wal.metrics) == n:
+            await asyncio.sleep(0.005)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return wal.metrics[-1][1]
+
+    sample = asyncio.run(sample_once())
+    assert sample["subscribed_markets"] == 0 and sample["subscribed_tokens"] == 0
+    assert "assets_seen" not in sample
+
+    gamma.top = [mk("A"), mk("B")]
+    cycle(orch)
+    with caplog.at_level("INFO", logger="src.orchestrator"):
+        sample = asyncio.run(sample_once())
+    assert sample["subscribed_markets"] == 2 and sample["subscribed_tokens"] == 4
+    assert "subs=2/4" in caplog.text
+
+    # B drops out and is evicted to stay under the cap: counts go down, not up.
+    gamma.top = [mk("A"), mk("C", volume=1000)]
+    gamma.status = {"B": mk("B", volume=5)}
+    cycle(orch)
+    sample = asyncio.run(sample_once())
+    assert sample["subscribed_markets"] == 2 and sample["subscribed_tokens"] == 4
+    assert orch.subscribed_markets == {"A", "C"}
